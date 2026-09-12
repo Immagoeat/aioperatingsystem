@@ -71,6 +71,16 @@ static void read_regs(unsigned char *regs) {
 		outb(VGA_AC_INDEX, i);
 		*regs++ = inb(VGA_AC_READ);
 	}
+
+	/* Reading the Attribute Controller leaves its index register pointing
+	 * at the last index we read, with the "palette address source" /
+	 * video-enable bit (0x20) cleared. On real VGA (and QEMU's strict
+	 * "std" VGA model, unlike its more lenient Cirrus emulation) that
+	 * blanks the display until something re-sets it - so without this the
+	 * screen goes black the moment we snapshot the registers, even though
+	 * we never asked to change anything. */
+	(void)inb(VGA_INSTAT_READ);
+	outb(VGA_AC_INDEX, 0x20);
 }
 
 void vga_snapshot_current_mode(void) {
