@@ -38,11 +38,13 @@ desktop GUI a `gui` command away.
 
 ## The GUI
 
-Type `gui` at the shell prompt to switch into the graphical desktop. Move
-the mouse to control the cursor, drag windows by their title bars, click a
-window (or its taskbar button) to bring it to the front, and click the red
-button in a title bar to close it. Press `q` on the keyboard to return to
-the text shell at any time.
+The desktop launches automatically 3 seconds after the shell starts —
+press any key during the countdown to cancel it and stay at the text
+prompt instead, or type `gui` yourself at any time. Move the mouse to
+control the cursor, drag windows by their title bars, click a window (or
+its taskbar button) to bring it to the front, and click the red button in
+a title bar to close it. Press `q` on the keyboard to return to the text
+shell at any time.
 
 Unlike the classic "hobby OS" approach of banging VGA CRTC/Sequencer/GC
 registers directly to switch video modes, auroraOS never touches legacy VGA
@@ -73,9 +75,16 @@ generation rule in the Makefile (following the existing `wallpaper_day` /
 
 - `gcc` with 32-bit support (`-m32`)
 - GNU `ld`, `binutils`
-- `grub-mkimage` (from `grub-pc-bin` / `grub2-common`)
-- `genisoimage` or `mkisofs` (for ISO packaging — no `xorriso` required)
+- `grub-mkrescue` + `xorriso` (from `grub-pc-bin`/`grub2-common` and
+  `xorriso`) — preferred; produces a proper hybrid ISO (see below)
 - `qemu-system-i386` (to run it)
+
+If `xorriso` isn't available as a system package, `brew install xorriso`
+(Homebrew/Linuxbrew, no root needed) works fine. Without it, the build
+falls back to a hand-built El Torito-only ISO via `grub-mkimage` +
+`genisoimage`/`mkisofs` — that still boots from a real or virtual CD/DVD,
+but may not boot from a plain USB stick write (see "Running on real
+hardware" below).
 
 ## Building
 
@@ -84,11 +93,13 @@ make kernel      # build kernel_bin/auroraos.bin only
 make iso         # build kernel + auroraos.iso (bootable CD image)
 ```
 
-The ISO is built by [scripts/make_iso.sh](scripts/make_iso.sh), which uses
-`grub-mkimage` directly (targeting `i386-pc-eltorito`) with the GRUB config
-embedded via a memdisk, then packages it into a bootable El Torito ISO with
-`genisoimage`. This avoids depending on `grub-mkrescue`/`xorriso`, which may
-not be installed everywhere.
+The ISO is built by [scripts/make_iso.sh](scripts/make_iso.sh), which
+prefers `grub-mkrescue` (needs `xorriso`) since it produces a proper
+*hybrid* ISO — bootable both as an optical disc and as a raw USB disk
+image. If `xorriso`/`grub-mkrescue` aren't available, it falls back to
+building the ISO by hand with `grub-mkimage` (targeting
+`i386-pc-eltorito`) plus `genisoimage`, which avoids the `xorriso`
+dependency entirely but only reliably boots from a CD/DVD.
 
 ## Running
 
@@ -104,8 +115,39 @@ standard/non-Cirrus VGA+VBE emulation), which is what this was developed
 and tested against — Cirrus's emulation is more forgiving of imprecise VGA
 register programming in ways that can mask bugs real hardware won't.
 
-Once booted, you'll land in the `aurora:~$` shell prompt. Type `help` to see
+Once booted, you'll land in the `aurora:~$` shell prompt (or straight into
+the GUI after the 3-second autoboot countdown). Type `help` to see
 available commands, or `gui` to launch the desktop.
+
+## Running on real hardware
+
+`auroraos.iso` is a hybrid image: the same file boots correctly whether
+it's burned to a CD/DVD (via the El Torito boot catalog GRUB writes into
+it) or written raw to a USB flash drive (via an MBR partition table
+`grub-mkrescue` embeds pointing at the ISO's own El Torito data, using
+GRUB's `boot_hybrid.img`) — the same mechanism Ubuntu/Debian's own
+installer ISOs use. Concretely:
+
+- **USB stick** (the common case on modern PCs, which mostly have no
+  optical drive): write the ISO to the whole disk device, not a
+  partition, and not "extract the files" — e.g. `sudo dd if=auroraos.iso
+  of=/dev/sdX bs=4M status=progress && sync` on Linux/macOS (get the
+  right `/dev/sdX` from `lsblk`/`diskutil list` first — this overwrites
+  the whole drive), or [Rufus](https://rufus.ie) in "DD Image" mode on
+  Windows, or [balenaEtcher](https://etcher.balena.io)/Ventoy on any OS.
+- **CD/DVD**: burn `auroraos.iso` as a disc image (not as data files) with
+  any burning tool.
+- Boot from it: reboot the target PC, enter its boot menu or firmware
+  setup (commonly F12, F10, Esc, or Del at power-on) and pick the USB
+  drive or optical drive, or set it first in the boot order.
+- This targets legacy BIOS / El Torito booting specifically, not UEFI.
+  Most PCs still support this via a "Legacy Boot" / "CSM" (Compatibility
+  Support Module) option in firmware setup — enable that if the drive
+  doesn't show up in the boot menu on a UEFI-only machine.
+- It's a real kernel taking over the whole machine: no filesystem access
+  to your existing OS, no way back except a reboot/power cycle. Test in
+  QEMU first (`make run`) if you want to see it before trying real
+  hardware, and don't point it at a drive you care about.
 
 ## Project layout
 

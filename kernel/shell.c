@@ -67,6 +67,50 @@ static void reboot(void) {
 	for (;;) __asm__ volatile("hlt");
 }
 
+static void launch_gui(void) {
+	wm_init();
+	wm_run();
+	console_clear();
+	console_writestring("Returned to shell from GUI.\n");
+}
+
+/* Auto-boots into the GUI a few seconds after the shell starts, matching
+ * how a real desktop OS behaves rather than dropping you at a bare
+ * prompt. Any keypress during the countdown cancels it and drops you
+ * straight into the shell instead - so the shell stays fully reachable,
+ * it's just not the default anymore. */
+static void auto_launch_countdown(void) {
+	const uint32_t seconds = 3;
+	console_writestring("Starting desktop in ");
+	console_present();
+
+	for (uint32_t remaining = seconds; remaining > 0; remaining--) {
+		console_set_color(console_color_accent());
+		char digit = '0' + (char)remaining;
+		console_putchar(digit);
+		console_set_color(console_color_default());
+		console_writestring("... (press any key to cancel)");
+		console_present();
+
+		uint32_t deadline = timer_get_ticks() + 100; /* ~1 second */
+		while (timer_get_ticks() < deadline) {
+			if (keyboard_has_key()) {
+				keyboard_getchar_blocking(); /* consume it */
+				console_writestring("\nAutoboot cancelled.\n");
+				console_present();
+				return;
+			}
+			__asm__ volatile("hlt");
+		}
+
+		for (int i = 0; i < 40; i++) console_putchar('\b');
+	}
+
+	console_writestring("\n");
+	console_present();
+	launch_gui();
+}
+
 static void dispatch(char *line) {
 	char *saveptr;
 	char *cmd = strtok_simple(line, ' ', &saveptr);
@@ -87,10 +131,7 @@ static void dispatch(char *line) {
 	} else if (strcmp(cmd, "uptime") == 0) {
 		kprintf("Ticks since boot: %u (~%u sec)\n", timer_get_ticks(), timer_get_ticks() / 100);
 	} else if (strcmp(cmd, "gui") == 0) {
-		wm_init();
-		wm_run();
-		console_clear();
-		console_writestring("Returned to shell from GUI.\n");
+		launch_gui();
 	} else if (strcmp(cmd, "reboot") == 0) {
 		console_writestring("Rebooting...\n");
 		console_present();
@@ -113,6 +154,8 @@ static void dispatch(char *line) {
 }
 
 void shell_run(void) {
+	auto_launch_countdown();
+
 	for (;;) {
 		print_prompt();
 		read_line(cmd_buffer, CMD_BUFFER_SIZE);
