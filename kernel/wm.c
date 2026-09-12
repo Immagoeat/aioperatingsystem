@@ -39,6 +39,10 @@ struct window {
 	window_paint_fn paint;
 	int counter;
 	gfx_color_t accent;
+
+	bool minimized;
+	bool fullscreen;
+	int restore_x, restore_y, restore_w, restore_h; /* geometry before fullscreen, for the maximize button to restore */
 };
 
 static struct window windows[MAX_WINDOWS];
@@ -61,6 +65,16 @@ static int search_row_y0; /* y of the first result row, for click hit-testing */
 
 static int screen_w, screen_h;
 
+/* Cached bounds of the taskbar's per-window buttons, recomputed each
+ * frame in draw_taskbar() so handle_click() can hit-test them without
+ * re-deriving the same layout logic twice. */
+struct taskbar_button {
+	int window_idx;
+	int x, y, w, h;
+};
+static struct taskbar_button taskbar_buttons[MAX_WINDOWS];
+static int taskbar_button_count = 0;
+
 static void raise_window(int idx) {
 	int pos = -1;
 	for (int i = 0; i < window_count; i++) {
@@ -77,7 +91,7 @@ static int topmost_window_at(int x, int y) {
 	for (int i = window_count - 1; i >= 0; i--) {
 		int idx = window_order[i];
 		struct window *w = &windows[idx];
-		if (!w->used) continue;
+		if (!w->used || w->minimized) continue;
 		if (x >= w->x && x < w->x + w->w &&
 		    y >= w->y && y < w->y + w->h + TITLEBAR_H) {
 			return idx;
@@ -94,8 +108,10 @@ static void paint_about(struct window *w) {
 	gfx_draw_string(x, y, "A tiny hobby kernel with a", COL_TEXT); y += lh;
 	gfx_draw_string(x, y, "real graphical desktop.", COL_TEXT); y += lh + 8;
 	gfx_draw_string(x, y, "Drag windows by their", COL_TEXT_DIM); y += lh;
-	gfx_draw_string(x, y, "title bar. Click a taskbar", COL_TEXT_DIM); y += lh;
-	gfx_draw_string(x, y, "icon to focus a window.", COL_TEXT_DIM); y += lh;
+	gfx_draw_string(x, y, "title bar. The dots close,", COL_TEXT_DIM); y += lh;
+	gfx_draw_string(x, y, "minimize, and fullscreen it.", COL_TEXT_DIM); y += lh;
+	gfx_draw_string(x, y, "Click a taskbar icon to", COL_TEXT_DIM); y += lh;
+	gfx_draw_string(x, y, "focus or restore a window.", COL_TEXT_DIM); y += lh;
 	gfx_draw_string(x, y, "Press / to search for apps,", COL_TEXT_DIM); y += lh;
 	gfx_draw_string(x, y, "Ctrl+Q for the shell.", COL_TEXT_DIM);
 }
@@ -152,6 +168,8 @@ static int create_window(int x, int y, int w, int h, const char *title, window_p
 			windows[i].paint = paint;
 			windows[i].counter = 0;
 			windows[i].accent = accent;
+			windows[i].minimized = false;
+			windows[i].fullscreen = false;
 			strcpy(windows[i].title, title);
 			window_order[window_count++] = i;
 			return i;
@@ -196,7 +214,10 @@ static void launch_or_focus_app(int app_index) {
 	if (idx < 0) {
 		idx = create_window(base_cx + app->x_offset, base_cy + app->y_offset, app->w, app->h, app->name, app->paint, app->accent);
 	}
-	if (idx >= 0) raise_window(idx);
+	if (idx >= 0) {
+		windows[idx].minimized = false;
+		raise_window(idx);
+	}
 }
 
 void wm_init(void) {
@@ -211,7 +232,7 @@ void wm_init(void) {
 	base_cx = screen_w / 2 - 340;
 	base_cy = screen_h / 2 - 230;
 
-	register_app("About auroraOS", 0, 0, 500, 275, paint_about, COL_ACCENT);
+	register_app("About auroraOS", 0, 0, 500, 320, paint_about, COL_ACCENT);
 	register_app("Uptime", 540, 0, 280, 190, paint_counter, GFX_RGB(0x28, 0xC8, 0x40));
 	register_app("Palette", 100, 290, 320, 160, paint_palette, GFX_RGB(0xB1, 0x8C, 0xFF));
 
@@ -220,6 +241,26 @@ void wm_init(void) {
 
 static void draw_titlebar_button(int x, int y, gfx_color_t color) {
 	gfx_fill_round_rect(x, y, 12, 12, 6, color);
+}
+
+static void toggle_fullscreen(struct window *w) {
+	if (!w->fullscreen) {
+		w->restore_x = w->x;
+		w->restore_y = w->y;
+		w->restore_w = w->w;
+		w->restore_h = w->h;
+		w->fullscreen = true;
+		w->x = 0;
+		w->y = 0;
+		w->w = screen_w;
+		w->h = screen_h - TASKBAR_H - TITLEBAR_H;
+	} else {
+		w->fullscreen = false;
+		w->x = w->restore_x;
+		w->y = w->restore_y;
+		w->w = w->restore_w;
+		w->h = w->restore_h;
+	}
 }
 
 /* small pixel-art magnifying glass icon, centered at (cx, cy) */
@@ -273,16 +314,22 @@ static int search_matches(int *out) {
 
 static void draw_window(struct window *w, bool active) {
 	int total_h = w->h + TITLEBAR_H;
+	/* fullscreen windows fill the desktop edge-to-edge: no floating
+	 * shadow or rounded corners, the same way a real OS drops window
+	 * chrome once a window fills the whole screen */
+	int radius = w->fullscreen ? 0 : CORNER_RADIUS;
 
-	gfx_draw_soft_shadow(w->x, w->y, w->w, total_h, CORNER_RADIUS, 14);
+	if (!w->fullscreen) {
+		gfx_draw_soft_shadow(w->x, w->y, w->w, total_h, radius, 14);
+	}
 
 	gfx_color_t title_color = active ? COL_TITLE_ACT : COL_TITLE_INACT;
 
 	/* body + titlebar as one rounded shape, body drawn square-topped
 	 * underneath the rounded titlebar so the corners only round at top */
-	gfx_fill_round_rect(w->x, w->y, w->w, total_h, CORNER_RADIUS, active ? COL_WIN_BODY : COL_WIN_BODY_ALT);
-	gfx_fill_round_rect(w->x, w->y, w->w, TITLEBAR_H + CORNER_RADIUS, CORNER_RADIUS, title_color);
-	gfx_fill_rect(w->x, w->y + TITLEBAR_H, w->w, CORNER_RADIUS, title_color);
+	gfx_fill_round_rect(w->x, w->y, w->w, total_h, radius, active ? COL_WIN_BODY : COL_WIN_BODY_ALT);
+	gfx_fill_round_rect(w->x, w->y, w->w, TITLEBAR_H + radius, radius, title_color);
+	gfx_fill_rect(w->x, w->y + TITLEBAR_H, w->w, radius, title_color);
 	gfx_fill_rect(w->x, w->y + TITLEBAR_H, w->w, 1, GFX_RGB(0x00, 0x00, 0x00));
 
 	/* traffic-light buttons */
@@ -297,7 +344,7 @@ static void draw_window(struct window *w, bool active) {
 	/* a thin accent strip under the titlebar when focused, a small
 	 * modern touch instead of a hard border everywhere */
 	if (active) {
-		gfx_fill_rect(w->x + CORNER_RADIUS, w->y + total_h - 1, w->w - 2 * CORNER_RADIUS, 1, w->accent);
+		gfx_fill_rect(w->x + radius, w->y + total_h - 1, w->w - 2 * radius, 1, w->accent);
 	}
 
 	if (w->paint) w->paint(w);
@@ -380,7 +427,12 @@ static void draw_taskbar(void) {
 
 	int bx = search_btn_x + search_btn_w + 12;
 	int bx_max = wallpaper_btn_x - 12; /* don't draw window buttons under the right-side widgets */
-	int topmost = window_count > 0 ? window_order[window_count - 1] : -1;
+	int topmost = -1;
+	for (int i = window_count - 1; i >= 0; i--) {
+		int idx = window_order[i];
+		if (windows[idx].used && !windows[idx].minimized) { topmost = idx; break; }
+	}
+	taskbar_button_count = 0;
 	for (int i = 0; i < window_count; i++) {
 		int idx = window_order[i];
 		struct window *w = &windows[idx];
@@ -388,9 +440,22 @@ static void draw_taskbar(void) {
 		int tw = gfx_string_width(w->title) + 32;
 		if (bx + tw > bx_max) break; /* out of room; skip remaining buttons */
 		bool active = (idx == topmost);
-		gfx_fill_round_rect(bx, y + 8, tw, TASKBAR_H - 16, 8, active ? COL_TASKBAR_ACTIVE : GFX_RGB(0x1C, 0x1F, 0x2C));
+		gfx_color_t text_color = w->minimized ? COL_TEXT_DIM : (active ? COL_TEXT : COL_TEXT_DIM);
+		gfx_fill_round_rect(bx, y + 8, tw, TASKBAR_H - 16, 8,
+			active ? COL_TASKBAR_ACTIVE : (w->minimized ? GFX_RGB(0x15, 0x17, 0x22) : GFX_RGB(0x1C, 0x1F, 0x2C)));
 		if (active) gfx_fill_rect(bx + 8, y + TASKBAR_H - 6, tw - 16, 2, w->accent);
-		gfx_draw_string(bx + 16, y + (TASKBAR_H - gfx_char_height()) / 2, w->title, active ? COL_TEXT : COL_TEXT_DIM);
+		if (w->minimized) {
+			/* small dash icon hints "this is minimized, click to restore" */
+			gfx_fill_rect(bx + 8, y + TASKBAR_H / 2 - 1, 8, 2, COL_TEXT_DIM);
+			gfx_draw_string(bx + 22, y + (TASKBAR_H - gfx_char_height()) / 2, w->title, text_color);
+		} else {
+			gfx_draw_string(bx + 16, y + (TASKBAR_H - gfx_char_height()) / 2, w->title, text_color);
+		}
+
+		if (taskbar_button_count < MAX_WINDOWS) {
+			taskbar_buttons[taskbar_button_count++] = (struct taskbar_button){ idx, bx, y + 8, tw, TASKBAR_H - 16 };
+		}
+
 		bx += tw + 8;
 	}
 
@@ -462,85 +527,97 @@ static void draw_search_panel(void) {
 	}
 }
 
-/* A bigger, higher-contrast cursor than a stock 1px hobby-OS arrow: drawn
- * at 2x scale with a full black outline on every side (not just the
- * trailing edges) and an accent-colored fill, so it stays readable over
- * both the light and dark wallpapers instead of disappearing into them. */
-#define CURSOR_ROWS 15
-#define CURSOR_COLS 15
-#define CURSOR_SCALE 2
+/* A detailed, smooth-edged cursor modeled on a real desktop OS arrow:
+ * a tapered silhouette (not a blocky diagonal staircase) at native pixel
+ * resolution with soft anti-aliased edges, a crisp dark outline, a subtle
+ * highlight down the spine for a bit of dimensionality, and a soft drop
+ * shadow - so it reads clearly over both light and dark wallpapers
+ * without looking like flat pixel art. */
+#define CURSOR_ROWS 24
+#define CURSOR_COLS 18
+
+/* 'X' = solid fill, 'B' = solid outline, 'H' = highlight, '.' = empty.
+ * A soft (partially transparent) anti-aliasing pass runs after this,
+ * so the shape only needs to define the crisp core. */
+static const char *cursor_shape[CURSOR_ROWS] = {
+	"BB................",
+	"BXB...............",
+	"BXXB..............",
+	"BHXXB.............",
+	"BHXXXB............",
+	"BHXXXXB...........",
+	"BHXXXXXB..........",
+	"BHXXXXXXB.........",
+	"BHXXXXXXXB........",
+	"BHXXXXXXXXB.......",
+	"BHXXXXXXXXXB......",
+	"BHXXXXXXXXXXB.....",
+	"BHXXXXXXBBBBB.....",
+	"BHXXXHXXB.........",
+	"BHXXXXXXB.........",
+	"BHXXBHXXXB........",
+	"BHXXB.HXXXB.......",
+	"BHXB..HXXXB.......",
+	"BXB....BXXXB......",
+	"BB.....BXXXB......",
+	"B.......BXXXB.....",
+	".........BXXXB....",
+	".........BBBBB....",
+	"..................",
+};
+
+static gfx_color_t cursor_cell_color(char c) {
+	switch (c) {
+		case 'X': return COL_WHITE;
+		case 'B': return COL_BLACK;
+		case 'H': return GFX_RGB(0xC8, 0xD8, 0xF0); /* faint cool highlight down the spine */
+		default: return 0;
+	}
+}
 
 static void draw_cursor(int x, int y) {
-	static const char *shape[CURSOR_ROWS] = {
-		"X..............",
-		"XX.............",
-		"X.X............",
-		"X..X...........",
-		"X...X..........",
-		"X....X.........",
-		"X.....X........",
-		"X......X.......",
-		"X.......X......",
-		"X........X.....",
-		"X.....XXXXX....",
-		"X....XX........",
-		"X...X..........",
-		"X..X...........",
-		"X.X............",
-	};
-	bool filled[CURSOR_ROWS][CURSOR_COLS] = {0};
+	/* soft drop shadow: blur the whole silhouette outward a couple of
+	 * pixels at low alpha, offset down-right, for a sense of depth
+	 * rather than the cursor looking pasted flat onto the desktop */
 	for (int row = 0; row < CURSOR_ROWS; row++) {
 		for (int col = 0; col < CURSOR_COLS; col++) {
-			filled[row][col] = shape[row][col] == 'X';
-		}
-	}
-
-	/* soft drop shadow, offset down-right */
-	for (int row = 0; row < CURSOR_ROWS; row++) {
-		for (int col = 0; col < CURSOR_COLS; col++) {
-			if (filled[row][col]) {
-				gfx_blend_rect(x + (col + 2) * CURSOR_SCALE, y + (row + 2) * CURSOR_SCALE,
-					CURSOR_SCALE, CURSOR_SCALE, COL_BLACK, 90);
+			if (cursor_shape[row][col] == '.') continue;
+			for (int sd = 2; sd >= 1; sd--) {
+				uint8_t alpha = sd == 1 ? 70 : 35;
+				gfx_blend_pixel(x + col + sd, y + row + sd, COL_BLACK, alpha);
 			}
 		}
 	}
 
-	/* black outline: any filled cell's empty neighbors (4-directional)
-	 * get an outline pixel, so the cursor reads clearly on any background */
+	/* anti-aliased edge: any empty cell adjacent to a filled one gets a
+	 * half-strength blend of the outline color, softening the silhouette
+	 * boundary instead of leaving a hard aliased pixel edge */
+	static const int dr[8] = {-1, -1, -1, 0, 0, 1, 1, 1};
+	static const int dc[8] = {-1, 0, 1, -1, 1, -1, 0, 1};
 	for (int row = 0; row < CURSOR_ROWS; row++) {
 		for (int col = 0; col < CURSOR_COLS; col++) {
-			if (!filled[row][col]) continue;
-			static const int dr[4] = {-1, 1, 0, 0};
-			static const int dc[4] = {0, 0, -1, 1};
-			for (int d = 0; d < 4; d++) {
+			if (cursor_shape[row][col] != '.') continue;
+			bool touches_shape = false;
+			for (int d = 0; d < 8; d++) {
 				int nr = row + dr[d], nc = col + dc[d];
-				bool neighbor_filled = (nr >= 0 && nr < CURSOR_ROWS && nc >= 0 && nc < CURSOR_COLS) && filled[nr][nc];
-				if (!neighbor_filled) {
-					gfx_fill_rect(x + (nc + 1) * CURSOR_SCALE, y + (nr + 1) * CURSOR_SCALE,
-						CURSOR_SCALE, CURSOR_SCALE, COL_BLACK);
+				if (nr >= 0 && nr < CURSOR_ROWS && nc >= 0 && nc < CURSOR_COLS &&
+				    cursor_shape[nr][nc] != '.') {
+					touches_shape = true;
+					break;
 				}
 			}
-			/* also cover diagonal gaps so the outline has no pinholes */
-			static const int ddr[4] = {-1, -1, 1, 1};
-			static const int ddc[4] = {-1, 1, -1, 1};
-			for (int d = 0; d < 4; d++) {
-				int nr = row + ddr[d], nc = col + ddc[d];
-				bool neighbor_filled = (nr >= 0 && nr < CURSOR_ROWS && nc >= 0 && nc < CURSOR_COLS) && filled[nr][nc];
-				if (!neighbor_filled) {
-					gfx_fill_rect(x + (nc + 1) * CURSOR_SCALE, y + (nr + 1) * CURSOR_SCALE,
-						CURSOR_SCALE, CURSOR_SCALE, COL_BLACK);
-				}
+			if (touches_shape) {
+				gfx_blend_pixel(x + col, y + row, COL_BLACK, 90);
 			}
 		}
 	}
 
-	/* fill */
+	/* crisp core on top */
 	for (int row = 0; row < CURSOR_ROWS; row++) {
 		for (int col = 0; col < CURSOR_COLS; col++) {
-			if (filled[row][col]) {
-				gfx_fill_rect(x + (col + 1) * CURSOR_SCALE, y + (row + 1) * CURSOR_SCALE,
-					CURSOR_SCALE, CURSOR_SCALE, COL_WHITE);
-			}
+			char c = cursor_shape[row][col];
+			if (c == '.') continue;
+			gfx_putpixel(x + col, y + row, cursor_cell_color(c));
 		}
 	}
 }
@@ -598,14 +675,38 @@ static void handle_click(int x, int y) {
 		return;
 	}
 
+	for (int i = 0; i < taskbar_button_count; i++) {
+		struct taskbar_button *btn = &taskbar_buttons[i];
+		if (point_in(x, y, btn->x, btn->y, btn->w, btn->h)) {
+			struct window *w = &windows[btn->window_idx];
+
+			int topmost_visible = -1;
+			for (int j = window_count - 1; j >= 0; j--) {
+				int oidx = window_order[j];
+				if (windows[oidx].used && !windows[oidx].minimized) { topmost_visible = oidx; break; }
+			}
+
+			if (w->minimized) {
+				w->minimized = false;
+				raise_window(btn->window_idx);
+			} else if (btn->window_idx == topmost_visible) {
+				w->minimized = true;
+			} else {
+				raise_window(btn->window_idx);
+			}
+			return;
+		}
+	}
+
 	int idx = topmost_window_at(x, y);
 	if (idx < 0) return;
 
 	struct window *w = &windows[idx];
 	raise_window(idx);
 
-	if (y >= w->y + TITLEBAR_H / 2 - 6 && y < w->y + TITLEBAR_H / 2 + 6 &&
-	    x >= w->x + 14 && x < w->x + 26) {
+	bool in_button_row = y >= w->y + TITLEBAR_H / 2 - 6 && y < w->y + TITLEBAR_H / 2 + 6;
+
+	if (in_button_row && x >= w->x + 14 && x < w->x + 26) {
 		w->used = false;
 		for (int i = 0; i < window_count; i++) {
 			if (window_order[i] == idx) {
@@ -619,7 +720,18 @@ static void handle_click(int x, int y) {
 		return;
 	}
 
+	if (in_button_row && x >= w->x + 34 && x < w->x + 46) {
+		w->minimized = true;
+		return;
+	}
+
+	if (in_button_row && x >= w->x + 54 && x < w->x + 66) {
+		toggle_fullscreen(w);
+		return;
+	}
+
 	if (y < w->y + TITLEBAR_H) {
+		if (w->fullscreen) return; /* fullscreen windows aren't draggable */
 		dragging_window = idx;
 		drag_offset_x = x - w->x;
 		drag_offset_y = y - w->y;
@@ -660,10 +772,16 @@ void wm_run(void) {
 			if (windows[i].used) windows[i].counter = (int)timer_get_ticks();
 		}
 
+		int topmost_visible = -1;
+		for (int i = window_count - 1; i >= 0; i--) {
+			struct window *w = &windows[window_order[i]];
+			if (w->used && !w->minimized) { topmost_visible = window_order[i]; break; }
+		}
+
 		draw_desktop_background();
 		for (int i = 0; i < window_count; i++) {
 			struct window *w = &windows[window_order[i]];
-			if (w->used) draw_window(w, i == window_count - 1);
+			if (w->used && !w->minimized) draw_window(w, window_order[i] == topmost_visible);
 		}
 		draw_taskbar();
 		draw_search_panel();

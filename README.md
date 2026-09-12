@@ -40,8 +40,12 @@ modern windowed desktop GUI a `gui` command away.
   — see [kernel/wm.c](kernel/wm.c)
 - Swappable wallpapers baked in at build time from
   [assets/wallpapers/](assets/wallpapers/) — see [kernel/wallpaper.c](kernel/wallpaper.c)
-- A bigger, high-contrast mouse cursor (2x scale, full black outline, drop
-  shadow) that stays readable over both light and dark wallpapers
+- A detailed, smooth-edged mouse cursor: a tapered arrow silhouette at
+  native pixel resolution with anti-aliased edges (not a blocky staircase),
+  a crisp outline, a subtle highlight, and a soft drop shadow, staying
+  readable over both light and dark wallpapers
+- Per-window minimize (to the taskbar) and fullscreen (edge-to-edge, no
+  chrome) via the title-bar dots, alongside close
 - Minimal freestanding libc (`string.c`, a tiny `printf`)
 - Multiboot memory map + framebuffer info parsing
 - An interactive shell with builtin commands:
@@ -52,10 +56,15 @@ modern windowed desktop GUI a `gui` command away.
 The desktop launches automatically 3 seconds after the shell starts —
 press any key during the countdown to cancel it and stay at the text
 prompt instead, or type `gui` yourself at any time. Move the mouse to
-control the cursor, drag windows by their title bars, click a window (or
-its taskbar button) to bring it to the front, and click the red button in
-a title bar to close it. Press `Ctrl+Q` on the keyboard to return to the
-text shell at any time.
+control the cursor, drag windows by their title bars, and click a window
+(or its taskbar button) to bring it to the front. Press `Ctrl+Q` on the
+keyboard to return to the text shell at any time.
+
+Each window has the familiar three title-bar dots: red closes it, yellow
+minimizes it (it drops to a taskbar button — click that button again to
+bring it back), and green toggles fullscreen (fills the whole desktop,
+edge to edge, no rounded corners or shadow — click it again, or the same
+button, to restore the window to its previous size and position).
 
 Unlike the classic "hobby OS" approach of banging VGA CRTC/Sequencer/GC
 registers directly to switch video modes, auroraOS never touches legacy VGA
