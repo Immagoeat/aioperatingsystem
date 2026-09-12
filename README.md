@@ -13,11 +13,37 @@ other BIOS VMs) and drops you into an interactive shell.
 - 8259 PIC remapping
 - Programmable Interval Timer (PIT) driver, 100 Hz tick
 - PS/2 keyboard driver (scancode set 1, shift/caps lock handling)
+- PS/2 mouse driver (IRQ12, standard 3-byte packet protocol)
 - VGA text-mode console driver (80x25, 16 colors, scrolling, cursor)
+- VGA mode 13h graphics driver (320x200, 256 colors) with a small graphics
+  library: pixels, lines, rects, an 8x8 bitmap font, and a back buffer
+- A tiny windowing GUI: draggable/closable windows with title bars and drop
+  shadows, a desktop background, a taskbar, a mouse cursor, and a few demo
+  apps (About, an animated uptime counter, a palette swatch viewer)
 - Minimal freestanding libc (`string.c`, a tiny `printf`)
 - Multiboot memory map parsing
 - An interactive shell with builtin commands:
-  `help`, `about`, `clear`, `echo`, `mem`, `uptime`, `color`, `reboot`, `halt`
+  `help`, `about`, `clear`, `echo`, `mem`, `uptime`, `color`, `gui`,
+  `reboot`, `halt`
+
+## The GUI
+
+Type `gui` at the shell prompt to switch into the graphical desktop. Move
+the mouse to control the cursor, drag windows by their title bars, click a
+window (or its taskbar button) to bring it to the front, and click the `x`
+in a title bar to close it. Press `q` on the keyboard to exit back to the
+text shell at any time.
+
+Switching between text mode and VGA mode 13h and back is done by hand
+(programming the CRTC/Sequencer/Graphics-Controller/Attribute-Controller
+registers directly — there's no BIOS to call once we're in 32-bit protected
+mode). The trickiest part was that mode 13h uses "chain-4" addressing,
+which scatters whatever gets drawn across all four VGA memory planes; text
+mode reads plane 0 for character codes and plane 1 for attributes, so
+switching back without clearing every plane first shows up as scrambled
+"static" instead of clean text. [kernel/vgamode13.c](kernel/vgamode13.c)
+clears all four planes and reloads the font into plane 2 before restoring
+the original (snapshotted-at-boot) text-mode registers.
 
 ## Requirements
 
@@ -57,9 +83,14 @@ available commands.
 - [kernel/kernel.c](kernel/kernel.c) — kernel entry point, boot sequence
 - [kernel/gdt.c](kernel/gdt.c), [kernel/idt.c](kernel/idt.c),
   [kernel/pic.c](kernel/pic.c) — CPU/interrupt setup
-- [kernel/timer.c](kernel/timer.c), [kernel/keyboard.c](kernel/keyboard.c) —
-  drivers
+- [kernel/timer.c](kernel/timer.c), [kernel/keyboard.c](kernel/keyboard.c),
+  [kernel/mouse.c](kernel/mouse.c) — drivers
 - [kernel/vga.c](kernel/vga.c) — text console
+- [kernel/vgamode13.c](kernel/vgamode13.c) — VGA mode 13h graphics mode
+  switch, text-mode snapshot/restore, palette control
+- [kernel/font8x8.c](kernel/font8x8.c) — 8x8 bitmap font (ASCII 0x20-0x7E)
+- [kernel/gfx.c](kernel/gfx.c) — graphics primitives + back buffer
+- [kernel/wm.c](kernel/wm.c) — window manager / compositor and demo apps
 - [kernel/shell.c](kernel/shell.c) — interactive shell
 - [kernel/memory.c](kernel/memory.c) — multiboot memory map
 - [kernel/linker.ld](kernel/linker.ld) — link script (loads at 1 MiB)

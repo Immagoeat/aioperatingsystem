@@ -16,6 +16,7 @@ static void print_banner(void) {
 
 void kernel_main(void) {
 	terminal_initialize();
+	vga_snapshot_current_mode();
 
 	terminal_setcolor(0x0E);
 	terminal_writestring("auroraOS booting...\n\n");
@@ -38,13 +39,16 @@ void kernel_main(void) {
 	kprintf("[boot] Installing PS/2 keyboard driver...\n");
 	keyboard_install();
 
+	kprintf("[boot] Installing PS/2 mouse driver...\n");
+	mouse_install();
+
 	kprintf("[boot] Enabling interrupts...\n");
 	__asm__ volatile("sti");
 
 	kprintf("[boot] Total memory: %u KB\n", memory_total_kb());
 	kprintf("\nauroraOS is ready.\n");
 	terminal_setcolor(0x08);
-	terminal_writestring("Type 'help' to see available commands.\n\n");
+	terminal_writestring("Type 'help' to see available commands. Type 'gui' to start the desktop.\n\n");
 	terminal_setcolor(0x0F);
 
 	shell_run();

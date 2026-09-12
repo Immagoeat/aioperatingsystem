@@ -42,6 +42,7 @@ static void cmd_help(void) {
 	terminal_writestring("  mem       - show memory map / totals\n");
 	terminal_writestring("  uptime    - show timer ticks since boot\n");
 	terminal_writestring("  color N   - set text color (0-15)\n");
+	terminal_writestring("  gui       - launch the graphical desktop (press 'q' to exit)\n");
 	terminal_writestring("  reboot    - reboot the machine\n");
 	terminal_writestring("  halt      - halt the CPU\n");
 }
@@ -100,6 +101,13 @@ static void dispatch(char *line) {
 		} else {
 			terminal_writestring("usage: color N   (0-15)\n");
 		}
+	} else if (strcmp(cmd, "gui") == 0) {
+		gfx_init();
+		wm_init();
+		wm_run();
+		vga_set_text_mode();
+		terminal_initialize();
+		terminal_writestring("Returned to shell from GUI.\n");
 	} else if (strcmp(cmd, "reboot") == 0) {
 		terminal_writestring("Rebooting...\n");
 		reboot();

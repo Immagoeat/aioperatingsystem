@@ -65,3 +65,7 @@ char keyboard_getchar_blocking(void) {
 	kbd_tail = (kbd_tail + 1) % KBD_BUFFER_SIZE;
 	return c;
 }
+
+bool keyboard_has_key(void) {
+	return kbd_head != kbd_tail;
+}
