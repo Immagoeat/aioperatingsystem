@@ -1,13 +1,21 @@
 # auroraOS
 
-A tiny 32-bit x86 hobby operating system kernel, written from scratch in C and
-x86 assembly. It boots via GRUB (Multiboot) into a high-resolution true-color
-graphics mode and drops you into a software console, with a modern windowed
-desktop GUI a `gui` command away.
+A tiny 64-bit (x86-64) hobby operating system kernel, written from scratch in
+C and x86 assembly. It boots via GRUB (Multiboot) into a high-resolution
+true-color graphics mode and drops you into a software console, with a
+modern windowed desktop GUI a `gui` command away.
 
 ## Features
 
-- Multiboot-compliant kernel entry, boots via GRUB
+- Multiboot-compliant kernel entry, boots via GRUB, then bootstraps itself
+  from 32-bit protected mode into 64-bit long mode: GRUB's Multiboot 1
+  hand-off only ever promises 32-bit protected mode (there's no "multiboot
+  but 64-bit" convention), so `_start` in [kernel/boot.s](kernel/boot.s)
+  builds a minimal identity-mapped page table (covering the first 4GB, via
+  2MB pages — needed because a VBE linear framebuffer commonly gets mapped
+  near the 4GB boundary), enables PAE, sets the long-mode bit in the EFER
+  MSR, turns on paging, and far-jumps into a 64-bit code segment before any
+  other kernel code runs
 - GRUB-negotiated VBE graphics mode (1024x768x32 requested via the Multiboot
   video-mode header fields; GRUB performs the actual BIOS video call before
   handing off to the kernel) — see [kernel/boot.s](kernel/boot.s)
@@ -96,11 +104,13 @@ a new one there automatically makes it searchable too.
 
 ## Requirements
 
-- `gcc` with 32-bit support (`-m32`)
+- `gcc` with x86-64 support (`-m64` — the default on essentially any Linux
+  gcc build)
 - GNU `ld`, `binutils`
 - `grub-mkrescue` + `xorriso` (from `grub-pc-bin`/`grub2-common` and
   `xorriso`) — preferred; produces a proper hybrid ISO (see below)
-- `qemu-system-i386` (to run it)
+- `qemu-system-x86_64` (to run it — `qemu-system-i386` can't execute the
+  64-bit long-mode code this kernel switches itself into during boot)
 
 If `xorriso` isn't available as a system package, `brew install xorriso`
 (Homebrew/Linuxbrew, no root needed) works fine. Without it, the build
@@ -198,10 +208,12 @@ installer ISOs use. Concretely:
 
 This is a real, from-scratch kernel: it manages its own interrupts, drivers,
 and display — nothing here rides on Linux or any other existing OS. It's a
-single-tasking, single-address-space 32-bit kernel meant as a hobby-OS
-starting point, not a production or multi-user operating system. The GUI
-runs as a blocking loop inside the shell rather than a separate process —
-there's no paging/virtual memory, no filesystem, no process scheduler, and
-no userspace program loader yet. Multitasking (so the GUI and shell, or
-multiple GUI apps, could run concurrently) is a natural next step if you
-want to keep extending it.
+single-tasking, 64-bit kernel meant as a hobby-OS starting point, not a
+production or multi-user operating system. Paging exists (long mode requires
+it) but only as a flat identity map set up once at boot — there's no
+per-process address space, no demand paging, no filesystem, no process
+scheduler, and no userspace program loader yet. The GUI runs as a blocking
+loop inside the shell rather than a separate process. Multitasking (so the
+GUI and shell, or multiple GUI apps, could run concurrently) and real virtual
+memory (per-process page tables) are natural next steps if you want to keep
+extending it.

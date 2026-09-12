@@ -1,4 +1,12 @@
-/* boot.s - Multiboot entry point for auroraOS */
+/* boot.s - Multiboot entry point for auroraOS, x86-64.
+ *
+ * GRUB still loads us via the classic Multiboot 1 protocol, which only
+ * promises 32-bit protected mode - there is no "multiboot but 64-bit"
+ * hand-off. So _start (32-bit) does the actual work of getting to long
+ * mode itself: build minimal page tables, enable PAE, set the long-mode
+ * bit in EFER, turn on paging, then load a 64-bit GDT and far-jump into
+ * _start64, which is where the real (64-bit) kernel begins.
+ */
 .set ALIGN,    1<<0
 .set MEMINFO,  1<<1
 .set VIDMODE,  1<<2
@@ -22,18 +30,137 @@
 .long 768
 .long 32
 
+/* --- page tables for the long-mode identity map ---
+ * One PML4 entry -> 4 PDPT entries -> 4 PD tables of 512 2MB huge pages
+ * each (PS bit), identity-mapping the first 4GB of physical address
+ * space. The kernel itself only needs the first ~1GB, but a VBE linear
+ * framebuffer on real hardware/QEMU commonly gets mapped by the BIOS/PCI
+ * BAR far higher (e.g. ~0xFD000000, near the 4GB boundary) - without
+ * mapping that too, gfx.c's first write to the framebuffer takes an
+ * unhandled page fault (no page fault handler exists yet either) that
+ * cascades into a triple fault. 2MB pages throughout rather than 1GB
+ * ones, since not every CPU/hypervisor guarantees 1GB page support
+ * (pdpe1gb) the way 2MB pages are universally available in long mode.
+ * Must be 4K-aligned; .bss so it's zeroed for us at load time. */
 .section .bss
+.align 4096
+pml4_table:
+	.skip 4096
+pdpt_table:
+	.skip 4096
+pd_table0:
+	.skip 4096
+pd_table1:
+	.skip 4096
+pd_table2:
+	.skip 4096
+pd_table3:
+	.skip 4096
+
 .align 16
 stack_bottom:
-.skip 16384 /* 16 KiB stack */
+.skip 65536 /* 64 KiB stack */
 stack_top:
 
 .section .text
+.code32
 .global _start
 .type _start, @function
 _start:
+	cli
 	mov $stack_top, %esp
-	movl %ebx, mb_info_ptr   /* save multiboot info pointer */
+	mov %ebx, %edi          /* stash multiboot info ptr (edi survives below) */
+
+	/* PML4[0] -> pdpt_table (present, writable) */
+	mov $pdpt_table, %eax
+	or $0x03, %eax
+	mov $pml4_table, %ebx
+	mov %eax, (%ebx)
+
+	/* PDPT[0..3] -> pd_table0..3 (present, writable), each covering 1GB */
+	mov $pdpt_table, %ebx
+	mov $pd_table0, %eax
+	or $0x03, %eax
+	mov %eax, 0(%ebx)
+	mov $pd_table1, %eax
+	or $0x03, %eax
+	mov %eax, 8(%ebx)
+	mov $pd_table2, %eax
+	or $0x03, %eax
+	mov %eax, 16(%ebx)
+	mov $pd_table3, %eax
+	or $0x03, %eax
+	mov %eax, 24(%ebx)
+
+	/* Fill each of the 4 PD tables with 512 2MB pages (present, writable,
+	 * huge). %edx carries the running physical address across all four
+	 * tables so together they cover a contiguous 0..4GB identity map;
+	 * each table is addressed by name explicitly rather than assumed to
+	 * be contiguous in memory with the others. */
+	mov $0, %edx              /* running physical address */
+	mov $pd_table0, %ebx
+	call fill_one_pd
+	mov $pd_table1, %ebx
+	call fill_one_pd
+	mov $pd_table2, %ebx
+	call fill_one_pd
+	mov $pd_table3, %ebx
+	call fill_one_pd
+	jmp fill_pd_done
+
+fill_one_pd:
+	mov $0, %ecx
+fill_one_pd_loop:
+	mov %edx, %eax
+	or $0x83, %eax            /* present | writable | page-size(2MB) */
+	mov %eax, (%ebx, %ecx, 8)
+	add $0x200000, %edx
+	inc %ecx
+	cmp $512, %ecx
+	jl fill_one_pd_loop
+	ret
+fill_pd_done:
+
+	/* load CR3 with the PML4 physical address */
+	mov $pml4_table, %eax
+	mov %eax, %cr3
+
+	/* enable PAE (CR4 bit 5) */
+	mov %cr4, %eax
+	or $0x20, %eax
+	mov %eax, %cr4
+
+	/* set the Long Mode Enable bit in the EFER MSR (0xC0000080, bit 8) */
+	mov $0xC0000080, %ecx
+	rdmsr
+	or $0x100, %eax
+	wrmsr
+
+	/* enable paging (CR0 bit 31) - this actually activates long mode
+	 * now that LME and PAE are set, but we're still in a 32-bit code
+	 * segment (compatibility submode) until the far jump below */
+	mov %cr0, %eax
+	or $0x80000000, %eax
+	mov %eax, %cr0
+
+	lgdt gdt64_ptr
+	ljmp $0x08, $_start64
+
+.size _start, . - _start
+
+.code64
+.extern kernel_main
+_start64:
+	mov $0x10, %ax
+	mov %ax, %ds
+	mov %ax, %es
+	mov %ax, %fs
+	mov %ax, %gs
+	mov %ax, %ss
+
+	mov $stack_top, %rsp
+	mov %edi, %edi           /* zero-extends edi -> rdi automatically on x86-64 */
+	mov %edi, mb_info_ptr(%rip)
 
 	call kernel_main
 
@@ -41,21 +168,34 @@ _start:
 hang:
 	hlt
 	jmp hang
-.size _start, . - _start
 
 .section .data
+.align 8
 .global mb_info_ptr
 mb_info_ptr:
 	.long 0
 
-/* --- ISR/IRQ common stubs --- */
+.align 16
+gdt64:
+	.quad 0                                   /* null descriptor */
+	.quad 0x00AF9A000000FFFF                  /* 64-bit code segment (L=1, present, executable, ring0) */
+	.quad 0x00AF92000000FFFF                  /* 64-bit data segment (present, writable, ring0) */
+gdt64_end:
+
+gdt64_ptr:
+	.word gdt64_end - gdt64 - 1
+	.quad gdt64
+
+/* --- ISR/IRQ common stubs (64-bit) --- */
 .section .text
+.code64
+
 .macro ISR_NOERR num
 .global isr\num
 isr\num:
 	cli
-	push $0
-	push $\num
+	pushq $0
+	pushq $\num
 	jmp isr_common_stub
 .endm
 
@@ -63,7 +203,7 @@ isr\num:
 .global isr\num
 isr\num:
 	cli
-	push $\num
+	pushq $\num
 	jmp isr_common_stub
 .endm
 
@@ -92,8 +232,8 @@ ISR_NOERR 19
 .global irq\remapped
 irq\remapped:
 	cli
-	push $0
-	push $\num
+	pushq $0
+	pushq $\num
 	jmp irq_common_stub
 .endm
 
@@ -114,65 +254,95 @@ IRQ 45, 13
 IRQ 46, 14
 IRQ 47, 15
 
+/* System V AMD64 calling convention: first integer arg goes in %rdi.
+ * We pass a pointer to the saved-registers struct there before calling
+ * into C, matching kernel.h's `struct registers *`. */
 .extern isr_handler
 isr_common_stub:
-	pusha
-	mov %ds, %ax
-	push %eax
+	push %r15
+	push %r14
+	push %r13
+	push %r12
+	push %r11
+	push %r10
+	push %r9
+	push %r8
+	push %rbp
+	push %rdi
+	push %rsi
+	push %rdx
+	push %rcx
+	push %rbx
+	push %rax
 
-	mov $0x10, %ax
-	mov %ax, %ds
-	mov %ax, %es
-	mov %ax, %fs
-	mov %ax, %gs
-
-	push %esp
+	mov %rsp, %rdi
 	call isr_handler
-	add $4, %esp
 
-	pop %eax
-	mov %ax, %ds
-	mov %ax, %es
-	mov %ax, %fs
-	mov %ax, %gs
+	pop %rax
+	pop %rbx
+	pop %rcx
+	pop %rdx
+	pop %rsi
+	pop %rdi
+	pop %rbp
+	pop %r8
+	pop %r9
+	pop %r10
+	pop %r11
+	pop %r12
+	pop %r13
+	pop %r14
+	pop %r15
 
-	popa
-	add $8, %esp
+	add $16, %rsp /* pop int_no + err_code */
 	sti
-	iret
+	iretq
 
 .extern irq_handler
 irq_common_stub:
-	pusha
-	mov %ds, %ax
-	push %eax
+	push %r15
+	push %r14
+	push %r13
+	push %r12
+	push %r11
+	push %r10
+	push %r9
+	push %r8
+	push %rbp
+	push %rdi
+	push %rsi
+	push %rdx
+	push %rcx
+	push %rbx
+	push %rax
 
-	mov $0x10, %ax
-	mov %ax, %ds
-	mov %ax, %es
-	mov %ax, %fs
-	mov %ax, %gs
-
-	push %esp
+	mov %rsp, %rdi
 	call irq_handler
-	add $4, %esp
 
-	pop %eax
-	mov %ax, %ds
-	mov %ax, %es
-	mov %ax, %fs
-	mov %ax, %gs
+	pop %rax
+	pop %rbx
+	pop %rcx
+	pop %rdx
+	pop %rsi
+	pop %rdi
+	pop %rbp
+	pop %r8
+	pop %r9
+	pop %r10
+	pop %r11
+	pop %r12
+	pop %r13
+	pop %r14
+	pop %r15
 
-	popa
-	add $8, %esp
+	add $16, %rsp
 	sti
-	iret
+	iretq
 
-/* --- GDT flush --- */
+/* --- GDT load (for our real, C-managed 64-bit GDT) --- */
 .global gdt_flush
 gdt_flush:
-	mov 4(%esp), %eax
-	lgdt (%eax)
+	lgdt (%rdi)
 
 	mov $0x10, %ax
 	mov %ax, %ds
@@ -181,13 +351,15 @@ gdt_flush:
 	mov %ax, %gs
 	mov %ax, %ss
 
-	jmp $0x08, $.flush
-.flush:
-	ret
+	/* reload CS via a far return, since there's no direct 64-bit "jmp
+	 * $seg, $offset" form in most assemblers' AT&T syntax */
+	pop %rax          /* return address pushed by `call` */
+	push $0x08
+	push %rax
+	lretq
 
 /* --- IDT load --- */
 .global idt_flush
 idt_flush:
-	mov 4(%esp), %eax
-	lidt (%eax)
+	lidt (%rdi)
 	ret

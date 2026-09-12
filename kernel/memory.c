@@ -43,7 +43,7 @@ struct mmap_entry {
 static struct multiboot_info *mbi = 0;
 
 void memory_init(uint32_t mb_info_addr) {
-	mbi = (struct multiboot_info *)mb_info_addr;
+	mbi = (struct multiboot_info *)(uintptr_t)mb_info_addr;
 }
 
 uint32_t memory_total_kb(void) {
@@ -97,12 +97,12 @@ void memory_print_map(void) {
 
 	if (mbi->flags & (1 << 6)) {
 		kprintf("\nMemory map:\n");
-		struct mmap_entry *entry = (struct mmap_entry *)mbi->mmap_addr;
-		uint32_t end = mbi->mmap_addr + mbi->mmap_length;
-		while ((uint32_t)entry < end) {
+		struct mmap_entry *entry = (struct mmap_entry *)(uintptr_t)mbi->mmap_addr;
+		uintptr_t end = (uintptr_t)mbi->mmap_addr + mbi->mmap_length;
+		while ((uintptr_t)entry < end) {
 			kprintf("  addr=0x%x len=0x%x type=%d\n",
 				(uint32_t)entry->addr, (uint32_t)entry->len, entry->type);
-			entry = (struct mmap_entry *)((uint32_t)entry + entry->size + 4);
+			entry = (struct mmap_entry *)((uintptr_t)entry + entry->size + 4);
 		}
 	}
 }

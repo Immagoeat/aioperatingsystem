@@ -46,11 +46,17 @@ void gdt_install(void);
 
 /* --- idt.c --- */
 void idt_install(void);
+/* Field order must exactly match what isr_common_stub/irq_common_stub in
+ * boot.s push onto the stack (in reverse push order - the last thing
+ * pushed sits at the lowest address, which is where %rsp/this struct's
+ * first field points when the handler is entered), followed by int_no
+ * and err_code, followed by what the CPU itself pushes on interrupt
+ * entry (rip/cs/rflags/rsp/ss). */
 struct registers {
-	uint32_t ds;
-	uint32_t edi, esi, ebp, esp, ebx, edx, ecx, eax;
-	uint32_t int_no, err_code;
-	uint32_t eip, cs, eflags, useresp, ss;
+	uint64_t rax, rbx, rcx, rdx, rsi, rdi, rbp;
+	uint64_t r8, r9, r10, r11, r12, r13, r14, r15;
+	uint64_t int_no, err_code;
+	uint64_t rip, cs, rflags, userrsp, ss;
 };
 typedef void (*isr_t)(struct registers *);
 void register_interrupt_handler(uint8_t n, isr_t handler);

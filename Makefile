@@ -2,9 +2,23 @@ CC = gcc
 AS = gcc
 LD = ld
 
-CFLAGS = -m32 -std=gnu11 -ffreestanding -O2 -Wall -Wextra -fno-stack-protector -fno-pie -no-pie
-ASFLAGS = -m32 -ffreestanding -c
-LDFLAGS = -m elf_i386 -T kernel/linker.ld -nostdlib
+# -mno-red-zone is mandatory for x86-64 kernel/freestanding code: the
+# System V ABI's 128-byte "red zone" below %rsp is only safe for code
+# that can never be interrupted asynchronously, which does not describe
+# an OS kernel taking hardware interrupts. -mcmodel=large keeps codegen
+# from assuming the kernel lives in the low 2GB with 32-bit-relative
+# addressing, since we control our own link address (1MB) rather than
+# a general-purpose toolchain default. -mgeneral-regs-only (which
+# implies -mno-sse/-mno-mmx/etc.) stops GCC from auto-vectorizing loops
+# (memcpy-like patterns especially) into SSE instructions: SSE2 is
+# baseline on x86-64 as far as the compiler's concerned, but using it
+# requires the kernel to have enabled it first (CR0/CR4 bits, plus
+# saving/restoring FPU/SSE state across interrupts) - we do neither, so
+# any SSE instruction traps as an Invalid Opcode exception. Simplest fix
+# for a kernel with no real floating-point needs: never emit them.
+CFLAGS = -m64 -mno-red-zone -mcmodel=large -mgeneral-regs-only -std=gnu11 -ffreestanding -O2 -Wall -Wextra -fno-stack-protector -fno-pie -no-pie
+ASFLAGS = -m64 -ffreestanding -c
+LDFLAGS = -m elf_x86_64 -T kernel/linker.ld -nostdlib -z max-page-size=0x1000
 
 # Wallpapers are baked in at build time as raw RGB C arrays (see
 # tools/img_to_c.py) since the freestanding kernel has no image decoder.
@@ -59,9 +73,11 @@ iso: kernel
 # for a VBE graphics mode, and it's GRUB that performs that BIOS video
 # mode call on our behalf before handing off to the kernel. -vga std
 # requests QEMU's standard (non-Cirrus) VGA/VBE emulation, which is what
-# this was developed and tested against.
+# this was developed and tested against. Needs qemu-system-x86_64, not
+# qemu-system-i386: the kernel switches itself into 64-bit long mode
+# early in boot.s, which an i386-only CPU model can't execute at all.
 run: iso
-	qemu-system-i386 -cdrom $(ISO) -vga std
+	qemu-system-x86_64 -cdrom $(ISO) -vga std
 
 clean:
 	rm -f kernel/*.o
