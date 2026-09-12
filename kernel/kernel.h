@@ -5,40 +5,28 @@
 #include <stddef.h>
 #include <stdbool.h>
 
+typedef uint32_t gfx_color_t; /* 0x00RRGGBB */
+#define GFX_RGB(r, g, b) (((gfx_color_t)(r) << 16) | ((gfx_color_t)(g) << 8) | (gfx_color_t)(b))
+
 /* --- io.c --- */
 uint8_t inb(uint16_t port);
 void outb(uint16_t port, uint8_t val);
 uint16_t inw(uint16_t port);
 void io_wait(void);
 
-/* --- vga.c / terminal --- */
-enum vga_color {
-	VGA_COLOR_BLACK = 0,
-	VGA_COLOR_BLUE = 1,
-	VGA_COLOR_GREEN = 2,
-	VGA_COLOR_CYAN = 3,
-	VGA_COLOR_RED = 4,
-	VGA_COLOR_MAGENTA = 5,
-	VGA_COLOR_BROWN = 6,
-	VGA_COLOR_LIGHT_GREY = 7,
-	VGA_COLOR_DARK_GREY = 8,
-	VGA_COLOR_LIGHT_BLUE = 9,
-	VGA_COLOR_LIGHT_GREEN = 10,
-	VGA_COLOR_LIGHT_CYAN = 11,
-	VGA_COLOR_LIGHT_RED = 12,
-	VGA_COLOR_LIGHT_MAGENTA = 13,
-	VGA_COLOR_LIGHT_BROWN = 14,
-	VGA_COLOR_WHITE = 15,
-};
-
-void terminal_initialize(void);
-void terminal_setcolor(uint8_t color);
-void terminal_putchar(char c);
-void terminal_write(const char *data, size_t size);
-void terminal_writestring(const char *data);
-void terminal_clear(void);
-void terminal_backspace(void);
-void terminal_set_cursor_visible(void);
+/* --- console.c: software text console rendered on the graphics
+ * framebuffer (there is no separate hardware text mode once we boot
+ * straight into a VBE linear framebuffer) --- */
+void console_init(void);
+void console_set_color(gfx_color_t color);
+gfx_color_t console_color_default(void);
+gfx_color_t console_color_accent(void);
+gfx_color_t console_color_dim(void);
+void console_clear(void);
+void console_putchar(char c);
+void console_write(const char *s, size_t len);
+void console_writestring(const char *s);
+void console_present(void);
 
 /* --- string.c --- */
 size_t strlen(const char *str);
@@ -85,9 +73,20 @@ bool keyboard_has_key(void);
 void shell_run(void);
 
 /* --- memory.c --- */
+struct fb_info {
+	uint64_t addr;
+	uint32_t pitch;
+	uint32_t width;
+	uint32_t height;
+	uint8_t bpp;
+	uint8_t red_pos, red_size;
+	uint8_t green_pos, green_size;
+	uint8_t blue_pos, blue_size;
+};
 void memory_init(uint32_t mb_info_addr);
 void memory_print_map(void);
 uint32_t memory_total_kb(void);
+bool memory_get_framebuffer(struct fb_info *out);
 
 /* --- mouse.c --- */
 void mouse_install(void);
@@ -95,30 +94,33 @@ void mouse_set_bounds(int w, int h);
 void mouse_get_state(int *x, int *y, uint8_t *buttons);
 bool mouse_poll_dirty(void);
 
-/* --- vgamode13.c --- */
-void vga_set_mode13h(void);
-void vga_set_text_mode(void);
-void vga_snapshot_current_mode(void);
-void vga_set_palette_color(uint8_t index, uint8_t r, uint8_t g, uint8_t b);
-
 /* --- font8x8.c --- */
 const uint8_t *font8x8_get_glyph(char c);
 
 /* --- gfx.c --- */
-void gfx_init(void);
+bool gfx_init(void);
 int gfx_width(void);
 int gfx_height(void);
-void gfx_putpixel(int x, int y, uint8_t color);
-uint8_t gfx_getpixel(int x, int y);
-void gfx_fill_rect(int x, int y, int w, int h, uint8_t color);
-void gfx_draw_rect(int x, int y, int w, int h, uint8_t color);
-void gfx_draw_hline(int x, int y, int w, uint8_t color);
-void gfx_draw_vline(int x, int y, int h, uint8_t color);
-void gfx_draw_line(int x0, int y0, int x1, int y1, uint8_t color);
-void gfx_draw_char(int x, int y, char c, uint8_t fg);
-void gfx_draw_char_bg(int x, int y, char c, uint8_t fg, uint8_t bg);
-void gfx_draw_string(int x, int y, const char *s, uint8_t fg);
-void gfx_draw_string_bg(int x, int y, const char *s, uint8_t fg, uint8_t bg);
+void gfx_putpixel(int x, int y, gfx_color_t color);
+gfx_color_t gfx_getpixel(int x, int y);
+void gfx_blend_pixel(int x, int y, gfx_color_t color, uint8_t alpha);
+void gfx_fill_rect(int x, int y, int w, int h, gfx_color_t color);
+void gfx_blend_rect(int x, int y, int w, int h, gfx_color_t color, uint8_t alpha);
+void gfx_fill_round_rect(int x, int y, int w, int h, int radius, gfx_color_t color);
+void gfx_blend_round_rect(int x, int y, int w, int h, int radius, gfx_color_t color, uint8_t alpha);
+void gfx_draw_soft_shadow(int x, int y, int w, int h, int radius, int spread);
+void gfx_draw_rect(int x, int y, int w, int h, gfx_color_t color);
+void gfx_draw_hline(int x, int y, int w, gfx_color_t color);
+void gfx_draw_vline(int x, int y, int h, gfx_color_t color);
+void gfx_draw_line(int x0, int y0, int x1, int y1, gfx_color_t color);
+void gfx_set_font_scale(int scale);
+int gfx_char_width(void);
+int gfx_char_height(void);
+void gfx_draw_char(int x, int y, char c, gfx_color_t fg);
+void gfx_draw_char_bg(int x, int y, char c, gfx_color_t fg, gfx_color_t bg);
+void gfx_draw_string(int x, int y, const char *s, gfx_color_t fg);
+void gfx_draw_string_bg(int x, int y, const char *s, gfx_color_t fg, gfx_color_t bg);
+int gfx_string_width(const char *s);
 void gfx_flip(void);
 
 /* --- wm.c --- */

@@ -7,7 +7,7 @@ static void print_uint(unsigned int value, unsigned int base, bool upper) {
 	int i = 0;
 
 	if (value == 0) {
-		terminal_putchar('0');
+		console_putchar('0');
 		return;
 	}
 
@@ -17,13 +17,13 @@ static void print_uint(unsigned int value, unsigned int base, bool upper) {
 	}
 
 	while (i > 0) {
-		terminal_putchar(buf[--i]);
+		console_putchar(buf[--i]);
 	}
 }
 
 static void print_int(int value) {
 	if (value < 0) {
-		terminal_putchar('-');
+		console_putchar('-');
 		print_uint((unsigned int)(-value), 10, false);
 	} else {
 		print_uint((unsigned int)value, 10, false);
@@ -36,7 +36,7 @@ void kprintf(const char *fmt, ...) {
 
 	for (size_t i = 0; fmt[i] != '\0'; i++) {
 		if (fmt[i] != '%') {
-			terminal_putchar(fmt[i]);
+			console_putchar(fmt[i]);
 			continue;
 		}
 
@@ -56,23 +56,24 @@ void kprintf(const char *fmt, ...) {
 				print_uint(va_arg(args, unsigned int), 16, true);
 				break;
 			case 'c':
-				terminal_putchar((char)va_arg(args, int));
+				console_putchar((char)va_arg(args, int));
 				break;
 			case 's': {
 				const char *s = va_arg(args, const char *);
 				if (!s) s = "(null)";
-				terminal_writestring(s);
+				console_writestring(s);
 				break;
 			}
 			case '%':
-				terminal_putchar('%');
+				console_putchar('%');
 				break;
 			default:
-				terminal_putchar('%');
-				terminal_putchar(fmt[i]);
+				console_putchar('%');
+				console_putchar(fmt[i]);
 				break;
 		}
 	}
 
 	va_end(args);
+	console_present();
 }

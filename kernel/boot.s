@@ -1,7 +1,8 @@
 /* boot.s - Multiboot entry point for auroraOS */
 .set ALIGN,    1<<0
 .set MEMINFO,  1<<1
-.set FLAGS,    ALIGN | MEMINFO
+.set VIDMODE,  1<<2
+.set FLAGS,    ALIGN | MEMINFO | VIDMODE
 .set MAGIC,    0x1BADB002
 .set CHECKSUM, -(MAGIC + FLAGS)
 
@@ -10,6 +11,16 @@
 .long MAGIC
 .long FLAGS
 .long CHECKSUM
+/* address fields (unused, header_addr etc.) - zero since we don't set
+ * the AOUT_KLUDGE flag */
+.long 0, 0, 0, 0, 0
+/* video mode request: mode_type=0 (linear graphics), width, height, depth.
+ * GRUB performs the VBE BIOS call for us before starting the kernel and
+ * hands back the framebuffer address via the multiboot info structure. */
+.long 0
+.long 1024
+.long 768
+.long 32
 
 .section .bss
 .align 16

@@ -1,86 +1,174 @@
+/* gfx.c - true-color linear-framebuffer graphics library.
+ *
+ * Targets whatever VBE mode GRUB set up for us via the multiboot video
+ * mode request in boot.s (see memory_get_framebuffer()). Colors are plain
+ * 0xRRGGBB values; gfx_flip() packs them to the framebuffer's actual pixel
+ * format (typically 32bpp XRGB, but this handles 24bpp too) each frame. */
 #include "kernel.h"
 
-#define SCREEN_W 320
-#define SCREEN_H 200
+#define MAX_FB_W 1920
+#define MAX_FB_H 1080
 
-static uint8_t *const VGA_FB = (uint8_t *)0xA0000;
-static uint8_t back_buffer[SCREEN_W * SCREEN_H];
+static uint8_t *fb_addr;
+static uint32_t fb_pitch;
+static uint32_t fb_bpp;
+static uint8_t fb_red_pos, fb_green_pos, fb_blue_pos;
 
-/* --- 16-color "GUI palette" mapped onto VGA palette indices 0-15 --- */
-void gfx_init(void) {
-	vga_set_mode13h();
+static int screen_w = 1024;
+static int screen_h = 768;
 
-	/* Program a small custom palette (6-bit RGB per channel) for our GUI
-	 * colors at indices 0-15, so gfx_color_t below maps directly. */
-	vga_set_palette_color(0, 0, 0, 0);        /* 0  black */
-	vga_set_palette_color(1, 0, 0, 42);       /* 1  blue */
-	vga_set_palette_color(2, 0, 42, 0);       /* 2  green */
-	vga_set_palette_color(3, 0, 42, 42);      /* 3  cyan */
-	vga_set_palette_color(4, 42, 0, 0);       /* 4  red */
-	vga_set_palette_color(5, 42, 0, 42);      /* 5  magenta */
-	vga_set_palette_color(6, 42, 21, 0);      /* 6  brown */
-	vga_set_palette_color(7, 42, 42, 42);     /* 7  light grey */
-	vga_set_palette_color(8, 21, 21, 21);     /* 8  dark grey */
-	vga_set_palette_color(9, 21, 21, 63);     /* 9  light blue */
-	vga_set_palette_color(10, 21, 63, 21);    /* 10 light green */
-	vga_set_palette_color(11, 21, 63, 63);    /* 11 light cyan */
-	vga_set_palette_color(12, 63, 21, 21);    /* 12 light red */
-	vga_set_palette_color(13, 63, 21, 63);    /* 13 light magenta */
-	vga_set_palette_color(14, 63, 63, 21);    /* 14 yellow */
-	vga_set_palette_color(15, 63, 63, 63);    /* 15 white */
+/* Back buffer: one 32-bit color per pixel, blitted to the real framebuffer
+ * (in its native format) by gfx_flip(). Static allocation sized for the
+ * largest resolution we'll realistically be handed. */
+static gfx_color_t back_buffer[MAX_FB_W * MAX_FB_H];
 
-	/* Desktop-ish extra colors */
-	vga_set_palette_color(16, 8, 20, 36);     /* desktop teal-blue */
-	vga_set_palette_color(17, 32, 32, 40);    /* window body grey */
-	vga_set_palette_color(18, 12, 12, 16);    /* window shadow */
-	vga_set_palette_color(19, 10, 30, 55);    /* titlebar active */
-	vga_set_palette_color(20, 30, 30, 34);    /* titlebar inactive */
-	vga_set_palette_color(21, 46, 46, 50);    /* button face */
-	vga_set_palette_color(22, 58, 58, 60);    /* button highlight */
-	vga_set_palette_color(23, 18, 18, 20);    /* button shadow */
+bool gfx_init(void) {
+	struct fb_info fb;
+	if (!memory_get_framebuffer(&fb)) return false;
+	if (fb.bpp != 32 && fb.bpp != 24) return false;
+	if (fb.width > MAX_FB_W || fb.height > MAX_FB_H) return false;
 
-	memset(back_buffer, 16, sizeof(back_buffer));
+	fb_addr = (uint8_t *)(uintptr_t)fb.addr;
+	fb_pitch = fb.pitch;
+	fb_bpp = fb.bpp;
+	fb_red_pos = fb.red_pos;
+	fb_green_pos = fb.green_pos;
+	fb_blue_pos = fb.blue_pos;
+
+	screen_w = (int)fb.width;
+	screen_h = (int)fb.height;
+
+	memset(back_buffer, 0, sizeof(gfx_color_t) * (size_t)screen_w * (size_t)screen_h);
+	return true;
 }
 
-int gfx_width(void) { return SCREEN_W; }
-int gfx_height(void) { return SCREEN_H; }
+int gfx_width(void) { return screen_w; }
+int gfx_height(void) { return screen_h; }
 
-void gfx_putpixel(int x, int y, uint8_t color) {
-	if (x < 0 || y < 0 || x >= SCREEN_W || y >= SCREEN_H) return;
-	back_buffer[y * SCREEN_W + x] = color;
+static inline gfx_color_t blend(gfx_color_t bg, gfx_color_t fg, uint8_t alpha) {
+	if (alpha == 255) return fg;
+	if (alpha == 0) return bg;
+	uint32_t br = (bg >> 16) & 0xFF, bgc = (bg >> 8) & 0xFF, bb = bg & 0xFF;
+	uint32_t fr = (fg >> 16) & 0xFF, fgc = (fg >> 8) & 0xFF, fb_ = fg & 0xFF;
+	uint32_t r = (fr * alpha + br * (255 - alpha)) / 255;
+	uint32_t g = (fgc * alpha + bgc * (255 - alpha)) / 255;
+	uint32_t b = (fb_ * alpha + bb * (255 - alpha)) / 255;
+	return (r << 16) | (g << 8) | b;
 }
 
-uint8_t gfx_getpixel(int x, int y) {
-	if (x < 0 || y < 0 || x >= SCREEN_W || y >= SCREEN_H) return 0;
-	return back_buffer[y * SCREEN_W + x];
+void gfx_putpixel(int x, int y, gfx_color_t color) {
+	if (x < 0 || y < 0 || x >= screen_w || y >= screen_h) return;
+	back_buffer[y * screen_w + x] = color;
 }
 
-void gfx_fill_rect(int x, int y, int w, int h, uint8_t color) {
+gfx_color_t gfx_getpixel(int x, int y) {
+	if (x < 0 || y < 0 || x >= screen_w || y >= screen_h) return 0;
+	return back_buffer[y * screen_w + x];
+}
+
+void gfx_blend_pixel(int x, int y, gfx_color_t color, uint8_t alpha) {
+	if (x < 0 || y < 0 || x >= screen_w || y >= screen_h) return;
+	gfx_color_t *p = &back_buffer[y * screen_w + x];
+	*p = blend(*p, color, alpha);
+}
+
+void gfx_fill_rect(int x, int y, int w, int h, gfx_color_t color) {
 	int x0 = x < 0 ? 0 : x;
 	int y0 = y < 0 ? 0 : y;
-	int x1 = x + w; if (x1 > SCREEN_W) x1 = SCREEN_W;
-	int y1 = y + h; if (y1 > SCREEN_H) y1 = SCREEN_H;
+	int x1 = x + w; if (x1 > screen_w) x1 = screen_w;
+	int y1 = y + h; if (y1 > screen_h) y1 = screen_h;
 	for (int yy = y0; yy < y1; yy++) {
-		memset(&back_buffer[yy * SCREEN_W + x0], color, x1 - x0);
+		gfx_color_t *row = &back_buffer[yy * screen_w + x0];
+		for (int xx = 0; xx < x1 - x0; xx++) row[xx] = color;
 	}
 }
 
-void gfx_draw_rect(int x, int y, int w, int h, uint8_t color) {
+void gfx_blend_rect(int x, int y, int w, int h, gfx_color_t color, uint8_t alpha) {
+	int x0 = x < 0 ? 0 : x;
+	int y0 = y < 0 ? 0 : y;
+	int x1 = x + w; if (x1 > screen_w) x1 = screen_w;
+	int y1 = y + h; if (y1 > screen_h) y1 = screen_h;
+	for (int yy = y0; yy < y1; yy++) {
+		for (int xx = x0; xx < x1; xx++) {
+			gfx_color_t *p = &back_buffer[yy * screen_w + xx];
+			*p = blend(*p, color, alpha);
+		}
+	}
+}
+
+/* Rounded rectangle via a per-corner radius test; cheap enough at these
+ * resolutions and gives windows/buttons a modern, non-blocky silhouette. */
+void gfx_fill_round_rect(int x, int y, int w, int h, int radius, gfx_color_t color) {
+	if (radius <= 0) { gfx_fill_rect(x, y, w, h, color); return; }
+	if (radius * 2 > w) radius = w / 2;
+	if (radius * 2 > h) radius = h / 2;
+
+	for (int yy = 0; yy < h; yy++) {
+		int inset = 0;
+		if (yy < radius) {
+			int dy = radius - yy;
+			/* integer sqrt via simple search is fine at this scale */
+			int dx = 0;
+			while ((dx + 1) * (dx + 1) + dy * dy <= radius * radius) dx++;
+			inset = radius - dx;
+		} else if (yy >= h - radius) {
+			int dy = yy - (h - radius) + 1;
+			int dx = 0;
+			while ((dx + 1) * (dx + 1) + dy * dy <= radius * radius) dx++;
+			inset = radius - dx;
+		}
+		gfx_fill_rect(x + inset, y + yy, w - 2 * inset, 1, color);
+	}
+}
+
+void gfx_blend_round_rect(int x, int y, int w, int h, int radius, gfx_color_t color, uint8_t alpha) {
+	if (radius <= 0) { gfx_blend_rect(x, y, w, h, color, alpha); return; }
+	if (radius * 2 > w) radius = w / 2;
+	if (radius * 2 > h) radius = h / 2;
+
+	for (int yy = 0; yy < h; yy++) {
+		int inset = 0;
+		if (yy < radius) {
+			int dy = radius - yy;
+			int dx = 0;
+			while ((dx + 1) * (dx + 1) + dy * dy <= radius * radius) dx++;
+			inset = radius - dx;
+		} else if (yy >= h - radius) {
+			int dy = yy - (h - radius) + 1;
+			int dx = 0;
+			while ((dx + 1) * (dx + 1) + dy * dy <= radius * radius) dx++;
+			inset = radius - dx;
+		}
+		gfx_blend_rect(x + inset, y + yy, w - 2 * inset, 1, color, alpha);
+	}
+}
+
+/* Soft drop shadow: several nested translucent rounded rects, blurring
+ * outward. Cheap "fake gaussian" that reads fine at desktop scale. */
+void gfx_draw_soft_shadow(int x, int y, int w, int h, int radius, int spread) {
+	for (int i = spread; i > 0; i--) {
+		uint8_t alpha = (uint8_t)(18 - (14 * i) / spread);
+		if (alpha < 1) alpha = 1;
+		gfx_blend_round_rect(x - i, y - i, w + i * 2, h + i * 2, radius + i, 0x000000, alpha);
+	}
+}
+
+void gfx_draw_rect(int x, int y, int w, int h, gfx_color_t color) {
 	gfx_fill_rect(x, y, w, 1, color);
 	gfx_fill_rect(x, y + h - 1, w, 1, color);
 	gfx_fill_rect(x, y, 1, h, color);
 	gfx_fill_rect(x + w - 1, y, 1, h, color);
 }
 
-void gfx_draw_hline(int x, int y, int w, uint8_t color) {
+void gfx_draw_hline(int x, int y, int w, gfx_color_t color) {
 	gfx_fill_rect(x, y, w, 1, color);
 }
 
-void gfx_draw_vline(int x, int y, int h, uint8_t color) {
+void gfx_draw_vline(int x, int y, int h, gfx_color_t color) {
 	gfx_fill_rect(x, y, 1, h, color);
 }
 
-void gfx_draw_line(int x0, int y0, int x1, int y1, uint8_t color) {
+void gfx_draw_line(int x0, int y0, int x1, int y1, gfx_color_t color) {
 	int dx = x1 - x0; if (dx < 0) dx = -dx;
 	int dy = y1 - y0; if (dy < 0) dy = -dy;
 	int sx = x0 < x1 ? 1 : -1;
@@ -96,56 +184,101 @@ void gfx_draw_line(int x0, int y0, int x1, int y1, uint8_t color) {
 	}
 }
 
-void gfx_draw_char(int x, int y, char c, uint8_t fg) {
+static int glyph_scale = 2;
+
+void gfx_set_font_scale(int scale) {
+	glyph_scale = scale < 1 ? 1 : scale;
+}
+
+void gfx_draw_char(int x, int y, char c, gfx_color_t fg) {
 	const uint8_t *glyph = font8x8_get_glyph(c);
 	for (int row = 0; row < 8; row++) {
 		uint8_t bits = glyph[row];
 		for (int col = 0; col < 8; col++) {
 			if (bits & (0x80 >> col)) {
-				gfx_putpixel(x + col, y + row, fg);
+				gfx_fill_rect(x + col * glyph_scale, y + row * glyph_scale, glyph_scale, glyph_scale, fg);
 			}
 		}
 	}
 }
 
-void gfx_draw_char_bg(int x, int y, char c, uint8_t fg, uint8_t bg) {
+void gfx_draw_char_bg(int x, int y, char c, gfx_color_t fg, gfx_color_t bg) {
 	const uint8_t *glyph = font8x8_get_glyph(c);
 	for (int row = 0; row < 8; row++) {
 		uint8_t bits = glyph[row];
 		for (int col = 0; col < 8; col++) {
-			gfx_putpixel(x + col, y + row, (bits & (0x80 >> col)) ? fg : bg);
+			gfx_color_t color = (bits & (0x80 >> col)) ? fg : bg;
+			gfx_fill_rect(x + col * glyph_scale, y + row * glyph_scale, glyph_scale, glyph_scale, color);
 		}
 	}
 }
 
-void gfx_draw_string(int x, int y, const char *s, uint8_t fg) {
+int gfx_char_width(void) { return 8 * glyph_scale; }
+int gfx_char_height(void) { return 8 * glyph_scale; }
+
+void gfx_draw_string(int x, int y, const char *s, gfx_color_t fg) {
 	int cx = x;
+	int cw = gfx_char_width();
+	int ch = gfx_char_height();
 	while (*s) {
 		if (*s == '\n') {
 			cx = x;
-			y += 8;
+			y += ch;
 		} else {
 			gfx_draw_char(cx, y, *s, fg);
-			cx += 8;
+			cx += cw;
 		}
 		s++;
 	}
 }
 
-void gfx_draw_string_bg(int x, int y, const char *s, uint8_t fg, uint8_t bg) {
+void gfx_draw_string_bg(int x, int y, const char *s, gfx_color_t fg, gfx_color_t bg) {
 	int cx = x;
+	int cw = gfx_char_width();
+	int ch = gfx_char_height();
 	while (*s) {
 		if (*s == '\n') {
 			cx = x;
-			y += 8;
+			y += ch;
 		} else {
 			gfx_draw_char_bg(cx, y, *s, fg, bg);
-			cx += 8;
+			cx += cw;
 		}
 		s++;
 	}
+}
+
+int gfx_string_width(const char *s) {
+	int w = 0, max = 0, cw = gfx_char_width();
+	while (*s) {
+		if (*s == '\n') { if (w > max) max = w; w = 0; }
+		else w += cw;
+		s++;
+	}
+	return w > max ? w : max;
 }
 
 void gfx_flip(void) {
-	memcpy(VGA_FB, back_buffer, SCREEN_W * SCREEN_H);
+	for (int y = 0; y < screen_h; y++) {
+		uint8_t *dst_row = fb_addr + (size_t)y * fb_pitch;
+		gfx_color_t *src_row = &back_buffer[y * screen_w];
+		if (fb_bpp == 32) {
+			uint32_t *dst = (uint32_t *)dst_row;
+			for (int x = 0; x < screen_w; x++) {
+				gfx_color_t c = src_row[x];
+				uint32_t r = (c >> 16) & 0xFF, g = (c >> 8) & 0xFF, b = c & 0xFF;
+				dst[x] = (r << fb_red_pos) | (g << fb_green_pos) | (b << fb_blue_pos);
+			}
+		} else {
+			uint8_t *dst = dst_row;
+			for (int x = 0; x < screen_w; x++) {
+				gfx_color_t c = src_row[x];
+				uint32_t r = (c >> 16) & 0xFF, g = (c >> 8) & 0xFF, b = c & 0xFF;
+				uint32_t packed = (r << fb_red_pos) | (g << fb_green_pos) | (b << fb_blue_pos);
+				dst[x * 3 + 0] = packed & 0xFF;
+				dst[x * 3 + 1] = (packed >> 8) & 0xFF;
+				dst[x * 3 + 2] = (packed >> 16) & 0xFF;
+			}
+		}
+	}
 }

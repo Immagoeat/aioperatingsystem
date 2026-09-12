@@ -3,35 +3,52 @@
 extern uint32_t mb_info_ptr;
 
 static void print_banner(void) {
-	terminal_setcolor(0x0B);
-	terminal_writestring("    _                                 ____   _____\n");
-	terminal_writestring("   / \\  _   _ _ __ ___  _ __ __ _     / __ \\ / ____|\n");
-	terminal_writestring("  / _ \\| | | | '__/ _ \\| '__/ _` |   | |  | | (___  \n");
-	terminal_writestring(" / ___ \\ |_| | | | (_) | | | (_| |   | |  | |\\___ \\ \n");
-	terminal_writestring("/_/   \\_\\__,_|_|  \\___/|_|  \\__,_|    \\____/ ____) |\n");
-	terminal_writestring("                                            |_____/\n");
-	terminal_setcolor(0x0F);
-	terminal_writestring("\n");
+	gfx_color_t accent = console_color_accent();
+	console_set_color(accent);
+	console_writestring("    _                                 ____   _____\n");
+	console_writestring("   / \\  _   _ _ __ ___  _ __ __ _     / __ \\ / ____|\n");
+	console_writestring("  / _ \\| | | | '__/ _ \\| '__/ _` |   | |  | | (___  \n");
+	console_writestring(" / ___ \\ |_| | | | (_) | | | (_| |   | |  | |\\___ \\ \n");
+	console_writestring("/_/   \\_\\__,_|_|  \\___/|_|  \\__,_|    \\____/ ____) |\n");
+	console_writestring("                                            |_____/\n");
+	console_set_color(console_color_default());
+	console_writestring("\n");
+}
+
+static void halt_with_message(const char *msg) {
+	/* Framebuffer init failed - we have no console to draw to, so this
+	 * is one of the few spots left that has nothing to say anything
+	 * with. Just halt; a future revision could fall back to legacy VGA
+	 * text mode here if it becomes worth the complexity. */
+	(void)msg;
+	__asm__ volatile("cli");
+	for (;;) __asm__ volatile("hlt");
 }
 
 void kernel_main(void) {
-	terminal_initialize();
-	vga_snapshot_current_mode();
+	/* memory_init() must run before gfx_init(): the framebuffer address
+	 * GRUB handed us lives in the multiboot info structure. */
+	memory_init(mb_info_ptr);
 
-	terminal_setcolor(0x0E);
-	terminal_writestring("auroraOS booting...\n\n");
-	terminal_setcolor(0x0F);
+	if (!gfx_init()) {
+		halt_with_message("no linear framebuffer available");
+	}
+	gfx_set_font_scale(1);
+	console_init();
+
+	console_set_color(GFX_RGB(0xFF, 0xC1, 0x4E));
+	console_writestring("auroraOS booting...\n\n");
+	console_set_color(console_color_default());
 
 	print_banner();
+
+	kprintf("[boot] Framebuffer: %dx%d\n", gfx_width(), gfx_height());
 
 	kprintf("[boot] Installing GDT...\n");
 	gdt_install();
 
 	kprintf("[boot] Installing IDT...\n");
 	idt_install();
-
-	kprintf("[boot] Initializing memory map...\n");
-	memory_init(mb_info_ptr);
 
 	kprintf("[boot] Installing PIT timer (100Hz)...\n");
 	timer_install();
@@ -47,9 +64,9 @@ void kernel_main(void) {
 
 	kprintf("[boot] Total memory: %u KB\n", memory_total_kb());
 	kprintf("\nauroraOS is ready.\n");
-	terminal_setcolor(0x08);
-	terminal_writestring("Type 'help' to see available commands. Type 'gui' to start the desktop.\n\n");
-	terminal_setcolor(0x0F);
+	console_set_color(console_color_dim());
+	console_writestring("Type 'help' to see available commands. Type 'gui' to start the desktop.\n\n");
+	console_set_color(console_color_default());
 
 	shell_run();
 }
