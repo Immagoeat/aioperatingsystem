@@ -64,6 +64,14 @@ void timer_install(void);
 uint32_t timer_get_ticks(void);
 void timer_wait(uint32_t ticks);
 
+/* --- rtc.c --- */
+struct rtc_time {
+	uint8_t hours;   /* 0-23 */
+	uint8_t minutes; /* 0-59 */
+	uint8_t seconds; /* 0-59 */
+};
+void rtc_get_time(struct rtc_time *out);
+
 /* --- keyboard.c --- */
 void keyboard_install(void);
 char keyboard_getchar_blocking(void);

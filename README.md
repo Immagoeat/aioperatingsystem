@@ -16,8 +16,10 @@ desktop GUI a `gui` command away.
   hardware interrupts
 - 8259 PIC remapping
 - Programmable Interval Timer (PIT) driver, 100 Hz tick
-- PS/2 keyboard driver (scancode set 1, shift/caps lock handling)
+- PS/2 keyboard driver (scancode set 1, shift/caps lock/Ctrl handling)
 - PS/2 mouse driver (IRQ12, standard 3-byte packet protocol)
+- CMOS Real-Time Clock (RTC) driver for the real wall-clock time — see
+  [kernel/rtc.c](kernel/rtc.c)
 - A true-color linear-framebuffer graphics library: pixels, lines, rects,
   rounded rects, alpha blending, soft drop shadows, an 8x8 bitmap font
   (scalable), and a back buffer — see [kernel/gfx.c](kernel/gfx.c)
@@ -25,8 +27,9 @@ desktop GUI a `gui` command away.
   legacy VGA text mode in this design — see [kernel/console.c](kernel/console.c))
 - A modern-flat-design windowing GUI: soft shadows, rounded corners,
   macOS-style traffic-light window controls, swappable desktop wallpapers,
-  a taskbar with a live clock, and a few demo apps (About, an animated
-  uptime counter, a color palette viewer) — see [kernel/wm.c](kernel/wm.c)
+  a taskbar with a live wall-clock, an app-launcher search bar, and a few
+  demo apps (About, an animated uptime counter, a color palette viewer)
+  — see [kernel/wm.c](kernel/wm.c)
 - Swappable wallpapers baked in at build time from
   [assets/wallpapers/](assets/wallpapers/) — see [kernel/wallpaper.c](kernel/wallpaper.c)
 - A bigger, high-contrast mouse cursor (2x scale, full black outline, drop
@@ -70,6 +73,26 @@ scaled to whatever the real screen resolution turns out to be at boot via
 generation rule in the Makefile (following the existing `wallpaper_day` /
 `wallpaper_night` ones), then register it in the `wallpapers[]` array and
 `wallpaper_draw()` switch in [kernel/wallpaper.c](kernel/wallpaper.c).
+
+### Clock
+
+The taskbar shows the real wall-clock time (HH:MM:SS), read from the PC's
+CMOS Real-Time Clock — the same battery-backed chip every x86 PC has kept
+time on since the original IBM AT, so this reflects the actual system
+clock rather than time since boot. It's polled directly (no IRQ), refreshed
+once a second in [kernel/wm.c](kernel/wm.c)'s taskbar drawing code via
+[kernel/rtc.c](kernel/rtc.c).
+
+### Search
+
+Press `/` or click the magnifying-glass button in the taskbar to open the
+app search bar. Type to filter the demo apps by name (case-insensitive,
+matches anywhere in the name), press `Enter` or click a result to jump to
+it — raising it if it's already open, or (re)launching it if it was
+closed, the same way a real OS's app launcher works. `Escape` closes the
+search panel without picking anything. Apps are registered once in
+`wm_init()`'s `register_app()` calls in [kernel/wm.c](kernel/wm.c); adding
+a new one there automatically makes it searchable too.
 
 ## Requirements
 
@@ -157,7 +180,7 @@ installer ISOs use. Concretely:
 - [kernel/gdt.c](kernel/gdt.c), [kernel/idt.c](kernel/idt.c),
   [kernel/pic.c](kernel/pic.c) — CPU/interrupt setup
 - [kernel/timer.c](kernel/timer.c), [kernel/keyboard.c](kernel/keyboard.c),
-  [kernel/mouse.c](kernel/mouse.c) — drivers
+  [kernel/mouse.c](kernel/mouse.c), [kernel/rtc.c](kernel/rtc.c) — drivers
 - [kernel/font8x8.c](kernel/font8x8.c) — 8x8 bitmap font (ASCII 0x20-0x7E)
 - [kernel/gfx.c](kernel/gfx.c) — true-color framebuffer graphics primitives
 - [kernel/console.c](kernel/console.c) — software text console (the shell's
