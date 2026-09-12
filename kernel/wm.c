@@ -87,7 +87,7 @@ static void paint_about(struct window *w) {
 	gfx_draw_string(x, y, "Drag windows by their", COL_TEXT_DIM); y += lh;
 	gfx_draw_string(x, y, "title bar. Click a taskbar", COL_TEXT_DIM); y += lh;
 	gfx_draw_string(x, y, "icon to focus a window.", COL_TEXT_DIM); y += lh;
-	gfx_draw_string(x, y, "Press 'q' for the shell.", COL_TEXT_DIM);
+	gfx_draw_string(x, y, "Press Ctrl+Q for the shell.", COL_TEXT_DIM);
 }
 
 static void paint_counter(struct window *w) {
@@ -160,8 +160,8 @@ void wm_init(void) {
 
 	int cx = screen_w / 2 - 340;
 	int cy = screen_h / 2 - 230;
-	create_window(cx, cy, 470, 250, "About auroraOS", paint_about, COL_ACCENT);
-	create_window(cx + 510, cy, 280, 190, "Uptime", paint_counter, GFX_RGB(0x28, 0xC8, 0x40));
+	create_window(cx, cy, 500, 250, "About auroraOS", paint_about, COL_ACCENT);
+	create_window(cx + 540, cy, 280, 190, "Uptime", paint_counter, GFX_RGB(0x28, 0xC8, 0x40));
 	create_window(cx + 100, cy + 290, 320, 160, "Palette", paint_palette, GFX_RGB(0xB1, 0x8C, 0xFF));
 }
 
@@ -447,10 +447,10 @@ void wm_run(void) {
 
 		if (keyboard_has_key()) {
 			char c = keyboard_getchar_blocking();
-			if (c == 'q') {
+			if (c == CTRL_KEY('q')) {
 				gfx_set_font_scale(1);
 				return;
-			} else if (c == 'w') {
+			} else if (c == CTRL_KEY('w')) {
 				cycle_wallpaper();
 			}
 		}

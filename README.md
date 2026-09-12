@@ -43,8 +43,8 @@ press any key during the countdown to cancel it and stay at the text
 prompt instead, or type `gui` yourself at any time. Move the mouse to
 control the cursor, drag windows by their title bars, click a window (or
 its taskbar button) to bring it to the front, and click the red button in
-a title bar to close it. Press `q` on the keyboard to return to the text
-shell at any time.
+a title bar to close it. Press `Ctrl+Q` on the keyboard to return to the
+text shell at any time.
 
 Unlike the classic "hobby OS" approach of banging VGA CRTC/Sequencer/GC
 registers directly to switch video modes, auroraOS never touches legacy VGA
@@ -58,7 +58,7 @@ can — there's no separate "text mode" to fall out of sync with.
 
 ### Wallpapers
 
-Click the wallpaper button in the taskbar (or press `w`) to cycle through
+Click the wallpaper button in the taskbar (or press `Ctrl+W`) to cycle through
 the wallpapers in [assets/wallpapers/](assets/wallpapers/). There's no image
 decoder in a freestanding kernel, so wallpapers are converted to raw RGB and
 baked into the binary at build time by

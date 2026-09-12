@@ -6,6 +6,7 @@ static char kbd_buffer[KBD_BUFFER_SIZE];
 static volatile int kbd_head = 0;
 static volatile int kbd_tail = 0;
 static bool shift_pressed = false;
+static bool ctrl_pressed = false;
 static bool caps_lock = false;
 
 /* US QWERTY scancode set 1 -> ASCII (unshifted) */
@@ -39,6 +40,8 @@ static void keyboard_callback(struct registers *regs) {
 
 	if (scancode == 0x2A || scancode == 0x36) { shift_pressed = true; return; }
 	if (scancode == 0xAA || scancode == 0xB6) { shift_pressed = false; return; }
+	if (scancode == 0x1D) { ctrl_pressed = true; return; }  /* left ctrl down */
+	if (scancode == 0x9D) { ctrl_pressed = false; return; } /* left ctrl up */
 	if (scancode == 0x3A) { caps_lock = !caps_lock; return; }
 
 	if (scancode & 0x80) {
@@ -49,6 +52,16 @@ static void keyboard_callback(struct registers *regs) {
 		char c = shift_pressed ? scancode_ascii_shift[scancode] : scancode_ascii[scancode];
 		if (caps_lock && c >= 'a' && c <= 'z') c -= 32;
 		else if (caps_lock && c >= 'A' && c <= 'Z') c += 32;
+
+		if (ctrl_pressed && c >= 'a' && c <= 'z') {
+			/* Traditional Ctrl+letter encoding: Ctrl+A=1 .. Ctrl+Z=26,
+			 * same convention terminals have used forever. Keeps this
+			 * as a plain char so no new keyboard API is needed - callers
+			 * that care about Ctrl+<key> shortcuts just compare against
+			 * these values instead of the letter itself. */
+			c = (char)(c - 'a' + 1);
+		}
+
 		if (c) kbd_buffer_push(c);
 	}
 }

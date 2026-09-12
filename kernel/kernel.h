@@ -69,6 +69,11 @@ void keyboard_install(void);
 char keyboard_getchar_blocking(void);
 bool keyboard_has_key(void);
 
+/* Ctrl+<letter> comes through as byte values 1-26 (the same convention
+ * terminals have always used: Ctrl+A=1 .. Ctrl+Z=26), so a GUI shortcut
+ * bound to Ctrl+Q checks for CTRL_KEY('q') rather than the plain letter. */
+#define CTRL_KEY(c) ((c) - 'a' + 1)
+
 /* --- shell.c --- */
 void shell_run(void);
 

@@ -43,7 +43,7 @@ static void cmd_help(void) {
 	console_writestring("  echo TXT  - print TXT back\n");
 	console_writestring("  mem       - show memory map / totals\n");
 	console_writestring("  uptime    - show timer ticks since boot\n");
-	console_writestring("  gui       - launch the graphical desktop (press 'q' to exit)\n");
+	console_writestring("  gui       - launch the graphical desktop (Ctrl+Q to exit)\n");
 	console_writestring("  reboot    - reboot the machine\n");
 	console_writestring("  halt      - halt the CPU\n");
 }
