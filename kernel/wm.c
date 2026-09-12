@@ -48,6 +48,8 @@ static int window_count = 0;
 static int dragging_window = -1;
 static int drag_offset_x, drag_offset_y;
 
+static int wallpaper_btn_x, wallpaper_btn_y, wallpaper_btn_w, wallpaper_btn_h;
+
 static int screen_w, screen_h;
 
 static void raise_window(int idx) {
@@ -199,8 +201,10 @@ static void draw_window(struct window *w, bool active) {
 	if (w->paint) w->paint(w);
 }
 
-static void draw_desktop_background(void) {
-	/* vertical gradient - cheap but reads as "designed" rather than flat */
+static int current_wallpaper = 0;
+
+static void draw_gradient_fallback(void) {
+	/* vertical gradient - used only if no baked-in wallpaper is available */
 	for (int y = 0; y < screen_h - TASKBAR_H; y++) {
 		int t = (y * 255) / (screen_h - TASKBAR_H);
 		uint32_t r1 = (COL_DESKTOP_TOP >> 16) & 0xFF, g1 = (COL_DESKTOP_TOP >> 8) & 0xFF, b1 = COL_DESKTOP_TOP & 0xFF;
@@ -210,6 +214,20 @@ static void draw_desktop_background(void) {
 		uint32_t b = b1 + ((int)(b2 - b1) * t) / 255;
 		gfx_draw_hline(0, y, screen_w, GFX_RGB(r, g, b));
 	}
+}
+
+static void draw_desktop_background(void) {
+	if (wallpaper_count() > 0) {
+		wallpaper_draw(current_wallpaper, screen_w, screen_h);
+	} else {
+		draw_gradient_fallback();
+	}
+}
+
+static void cycle_wallpaper(void) {
+	int count = wallpaper_count();
+	if (count <= 0) return;
+	current_wallpaper = (current_wallpaper + 1) % count;
 }
 
 static void draw_taskbar(void) {
@@ -233,7 +251,7 @@ static void draw_taskbar(void) {
 		bx += tw + 8;
 	}
 
-	/* clock-ish uptime readout on the right */
+	/* clock-ish uptime readout on the far right */
 	char buf[16];
 	uint32_t secs = timer_get_ticks() / 100;
 	int i = 15;
@@ -244,52 +262,116 @@ static void draw_taskbar(void) {
 		buf[--i] = '0' + (secs % 10);
 		secs /= 10;
 	}
-	int tw = gfx_string_width(&buf[i]);
-	gfx_draw_string(screen_w - tw - 20, y + (TASKBAR_H - gfx_char_height()) / 2, &buf[i], COL_TEXT_DIM);
+	int clock_w = gfx_string_width(&buf[i]);
+	gfx_draw_string(screen_w - clock_w - 20, y + (TASKBAR_H - gfx_char_height()) / 2, &buf[i], COL_TEXT_DIM);
+
+	/* wallpaper-swap button, just left of the clock */
+	const struct wallpaper *wp = wallpaper_get(current_wallpaper);
+	const char *wp_label = wp ? wp->name : "Wallpaper";
+	int wp_btn_w = gfx_string_width(wp_label) + 40;
+	wallpaper_btn_x = screen_w - clock_w - 40 - wp_btn_w;
+	wallpaper_btn_y = y + 8;
+	wallpaper_btn_w = wp_btn_w;
+	wallpaper_btn_h = TASKBAR_H - 16;
+	gfx_fill_round_rect(wallpaper_btn_x, wallpaper_btn_y, wallpaper_btn_w, wallpaper_btn_h, 8, GFX_RGB(0x1C, 0x1F, 0x2C));
+	gfx_draw_string(wallpaper_btn_x + 12, y + (TASKBAR_H - gfx_char_height()) / 2, wp_label, COL_TEXT_DIM);
+	/* small swatch icon to hint "click to change" */
+	gfx_fill_round_rect(wallpaper_btn_x + wp_btn_w - 26, y + TASKBAR_H / 2 - 6, 12, 12, 4, COL_ACCENT);
 }
 
+/* A bigger, higher-contrast cursor than a stock 1px hobby-OS arrow: drawn
+ * at 2x scale with a full black outline on every side (not just the
+ * trailing edges) and an accent-colored fill, so it stays readable over
+ * both the light and dark wallpapers instead of disappearing into them. */
+#define CURSOR_ROWS 15
+#define CURSOR_COLS 15
+#define CURSOR_SCALE 2
+
 static void draw_cursor(int x, int y) {
-	static const char *shape[12] = {
-		"X...........",
-		"XX..........",
-		"X.X.........",
-		"X..X........",
-		"X...X.......",
-		"X....X......",
-		"X.....X.....",
-		"X......X....",
-		"X.......X...",
-		"X....XXXXX..",
-		"X..XX.......",
-		"XXX.........",
+	static const char *shape[CURSOR_ROWS] = {
+		"X..............",
+		"XX.............",
+		"X.X............",
+		"X..X...........",
+		"X...X..........",
+		"X....X.........",
+		"X.....X........",
+		"X......X.......",
+		"X.......X......",
+		"X........X.....",
+		"X.....XXXXX....",
+		"X....XX........",
+		"X...X..........",
+		"X..X...........",
+		"X.X............",
 	};
-	for (int row = 0; row < 12; row++) {
-		for (int col = 0; col < 13; col++) {
-			if (shape[row][col] == 'X') {
-				gfx_blend_pixel(x + col + 1, y + row + 1, COL_BLACK, 140);
+	bool filled[CURSOR_ROWS][CURSOR_COLS] = {0};
+	for (int row = 0; row < CURSOR_ROWS; row++) {
+		for (int col = 0; col < CURSOR_COLS; col++) {
+			filled[row][col] = shape[row][col] == 'X';
+		}
+	}
+
+	/* soft drop shadow, offset down-right */
+	for (int row = 0; row < CURSOR_ROWS; row++) {
+		for (int col = 0; col < CURSOR_COLS; col++) {
+			if (filled[row][col]) {
+				gfx_blend_rect(x + (col + 2) * CURSOR_SCALE, y + (row + 2) * CURSOR_SCALE,
+					CURSOR_SCALE, CURSOR_SCALE, COL_BLACK, 90);
 			}
 		}
 	}
-	for (int row = 0; row < 12; row++) {
-		for (int col = 0; col < 13; col++) {
-			if (shape[row][col] == 'X') {
-				gfx_putpixel(x + col, y + row, COL_WHITE);
+
+	/* black outline: any filled cell's empty neighbors (4-directional)
+	 * get an outline pixel, so the cursor reads clearly on any background */
+	for (int row = 0; row < CURSOR_ROWS; row++) {
+		for (int col = 0; col < CURSOR_COLS; col++) {
+			if (!filled[row][col]) continue;
+			static const int dr[4] = {-1, 1, 0, 0};
+			static const int dc[4] = {0, 0, -1, 1};
+			for (int d = 0; d < 4; d++) {
+				int nr = row + dr[d], nc = col + dc[d];
+				bool neighbor_filled = (nr >= 0 && nr < CURSOR_ROWS && nc >= 0 && nc < CURSOR_COLS) && filled[nr][nc];
+				if (!neighbor_filled) {
+					gfx_fill_rect(x + (nc + 1) * CURSOR_SCALE, y + (nr + 1) * CURSOR_SCALE,
+						CURSOR_SCALE, CURSOR_SCALE, COL_BLACK);
+				}
+			}
+			/* also cover diagonal gaps so the outline has no pinholes */
+			static const int ddr[4] = {-1, -1, 1, 1};
+			static const int ddc[4] = {-1, 1, -1, 1};
+			for (int d = 0; d < 4; d++) {
+				int nr = row + ddr[d], nc = col + ddc[d];
+				bool neighbor_filled = (nr >= 0 && nr < CURSOR_ROWS && nc >= 0 && nc < CURSOR_COLS) && filled[nr][nc];
+				if (!neighbor_filled) {
+					gfx_fill_rect(x + (nc + 1) * CURSOR_SCALE, y + (nr + 1) * CURSOR_SCALE,
+						CURSOR_SCALE, CURSOR_SCALE, COL_BLACK);
+				}
 			}
 		}
 	}
-	for (int row = 0; row < 11; row++) {
-		for (int col = 0; col < 12; col++) {
-			bool here = shape[row][col] == 'X';
-			bool right = shape[row][col + 1] == 'X';
-			bool down = shape[row + 1][col] == 'X';
-			if (here && (!right || !down)) {
-				gfx_putpixel(x + col, y + row, COL_BLACK);
+
+	/* fill */
+	for (int row = 0; row < CURSOR_ROWS; row++) {
+		for (int col = 0; col < CURSOR_COLS; col++) {
+			if (filled[row][col]) {
+				gfx_fill_rect(x + (col + 1) * CURSOR_SCALE, y + (row + 1) * CURSOR_SCALE,
+					CURSOR_SCALE, CURSOR_SCALE, COL_WHITE);
 			}
 		}
 	}
+}
+
+static bool point_in(int x, int y, int rx, int ry, int rw, int rh) {
+	return x >= rx && x < rx + rw && y >= ry && y < ry + rh;
 }
 
 static void handle_click(int x, int y) {
+	if (point_in(x, y, wallpaper_btn_x, wallpaper_btn_y, wallpaper_btn_w, wallpaper_btn_h)) {
+		cycle_wallpaper();
+		return;
+	}
+
 	int idx = topmost_window_at(x, y);
 	if (idx < 0) return;
 
@@ -368,6 +450,8 @@ void wm_run(void) {
 			if (c == 'q') {
 				gfx_set_font_scale(1);
 				return;
+			} else if (c == 'w') {
+				cycle_wallpaper();
 			}
 		}
 	}

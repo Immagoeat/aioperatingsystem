@@ -24,9 +24,13 @@ desktop GUI a `gui` command away.
 - A software text console rendered on the graphics framebuffer (there is no
   legacy VGA text mode in this design — see [kernel/console.c](kernel/console.c))
 - A modern-flat-design windowing GUI: soft shadows, rounded corners,
-  macOS-style traffic-light window controls, a gradient desktop background,
+  macOS-style traffic-light window controls, swappable desktop wallpapers,
   a taskbar with a live clock, and a few demo apps (About, an animated
   uptime counter, a color palette viewer) — see [kernel/wm.c](kernel/wm.c)
+- Swappable wallpapers baked in at build time from
+  [assets/wallpapers/](assets/wallpapers/) — see [kernel/wallpaper.c](kernel/wallpaper.c)
+- A bigger, high-contrast mouse cursor (2x scale, full black outline, drop
+  shadow) that stays readable over both light and dark wallpapers
 - Minimal freestanding libc (`string.c`, a tiny `printf`)
 - Multiboot memory map + framebuffer info parsing
 - An interactive shell with builtin commands:
@@ -49,6 +53,21 @@ GUI are just two different things drawn onto that same framebuffer with
 [kernel/gfx.c](kernel/gfx.c). Switching between them is instant, software-only,
 and can't corrupt display state the way mode-switching hardware registers
 can — there's no separate "text mode" to fall out of sync with.
+
+### Wallpapers
+
+Click the wallpaper button in the taskbar (or press `w`) to cycle through
+the wallpapers in [assets/wallpapers/](assets/wallpapers/). There's no image
+decoder in a freestanding kernel, so wallpapers are converted to raw RGB and
+baked into the binary at build time by
+[tools/img_to_c.py](tools/img_to_c.py) (see the `WALLPAPER_*` variables and
+rules in the [Makefile](Makefile)) — they're stored at a fixed 1280x800 and
+scaled to whatever the real screen resolution turns out to be at boot via
+`gfx_blit_rgb_scaled()`. To add your own: drop a PNG/JPG into
+`assets/wallpapers/`, add a `WALLPAPER_GEN`/`WALLPAPER_SRCS` entry and a
+generation rule in the Makefile (following the existing `wallpaper_day` /
+`wallpaper_night` ones), then register it in the `wallpapers[]` array and
+`wallpaper_draw()` switch in [kernel/wallpaper.c](kernel/wallpaper.c).
 
 ## Requirements
 
@@ -101,6 +120,9 @@ available commands, or `gui` to launch the desktop.
 - [kernel/gfx.c](kernel/gfx.c) — true-color framebuffer graphics primitives
 - [kernel/console.c](kernel/console.c) — software text console (the shell's
   display), rendered on the same framebuffer as the GUI
+- [kernel/wallpaper.c](kernel/wallpaper.c) — wallpaper registry (backed by
+  generated sources in `kernel/generated/`, built from
+  [assets/wallpapers/](assets/wallpapers/) by [tools/img_to_c.py](tools/img_to_c.py))
 - [kernel/wm.c](kernel/wm.c) — window manager / compositor and demo apps
 - [kernel/shell.c](kernel/shell.c) — interactive shell
 - [kernel/memory.c](kernel/memory.c) — multiboot memory map + framebuffer info

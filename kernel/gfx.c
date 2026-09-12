@@ -258,6 +258,32 @@ int gfx_string_width(const char *s) {
 	return w > max ? w : max;
 }
 
+/* Nearest-neighbor scaled blit of a raw packed-RGB source image (3 bytes
+ * per pixel, row-major, no padding) onto the back buffer. Used to draw
+ * baked-in wallpapers at whatever the actual runtime resolution turns
+ * out to be, since that isn't known at image-bake time. */
+void gfx_blit_rgb_scaled(const unsigned char *src_rgb, int src_w, int src_h, int dst_x, int dst_y, int dst_w, int dst_h) {
+	if (src_w <= 0 || src_h <= 0 || dst_w <= 0 || dst_h <= 0) return;
+
+	for (int y = 0; y < dst_h; y++) {
+		int sy = (y * src_h) / dst_h;
+		if (sy >= src_h) sy = src_h - 1;
+		const unsigned char *src_row = &src_rgb[(size_t)sy * src_w * 3];
+		int py = dst_y + y;
+		if (py < 0 || py >= screen_h) continue;
+
+		for (int x = 0; x < dst_w; x++) {
+			int sx = (x * src_w) / dst_w;
+			if (sx >= src_w) sx = src_w - 1;
+			int px = dst_x + x;
+			if (px < 0 || px >= screen_w) continue;
+
+			const unsigned char *p = &src_row[sx * 3];
+			back_buffer[py * screen_w + px] = GFX_RGB(p[0], p[1], p[2]);
+		}
+	}
+}
+
 void gfx_flip(void) {
 	for (int y = 0; y < screen_h; y++) {
 		uint8_t *dst_row = fb_addr + (size_t)y * fb_pitch;

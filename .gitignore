@@ -2,3 +2,4 @@
 *.iso
 kernel_bin/
 build/
+kernel/generated/

@@ -121,7 +121,21 @@ void gfx_draw_char_bg(int x, int y, char c, gfx_color_t fg, gfx_color_t bg);
 void gfx_draw_string(int x, int y, const char *s, gfx_color_t fg);
 void gfx_draw_string_bg(int x, int y, const char *s, gfx_color_t fg, gfx_color_t bg);
 int gfx_string_width(const char *s);
+void gfx_blit_rgb_scaled(const unsigned char *src_rgb, int src_w, int src_h, int dst_x, int dst_y, int dst_w, int dst_h);
 void gfx_flip(void);
+
+/* --- wallpaper.c: baked-in wallpaper images (see kernel/generated/,
+ * produced from assets/wallpapers/ by tools/img_to_c.py) plus a small
+ * registry so the desktop background can be swapped at runtime --- */
+struct wallpaper {
+	const char *name;
+	const unsigned char *rgb;
+	int width;
+	int height;
+};
+int wallpaper_count(void);
+const struct wallpaper *wallpaper_get(int index);
+void wallpaper_draw(int index, int dst_w, int dst_h);
 
 /* --- wm.c --- */
 void wm_init(void);
