@@ -3,3 +3,4 @@
 kernel_bin/
 build/
 kernel/generated/
+auroraos_disk.img

@@ -46,10 +46,29 @@ modern windowed desktop GUI a `gui` command away.
   readable over both light and dark wallpapers
 - Per-window minimize (to the taskbar) and fullscreen (edge-to-edge, no
   chrome) via the title-bar dots, alongside close
-- Minimal freestanding libc (`string.c`, a tiny `printf`)
+- A polling PIO ATA disk driver ([kernel/ata.c](kernel/ata.c)) and a real
+  FAT16 filesystem driver ([kernel/fat16.c](kernel/fat16.c)) — auroraOS
+  formats a blank attached disk as FAT16 itself on first boot, and every
+  file it writes is readable by any normal FAT16 tool (verified against
+  Linux's `mtools`), not just by auroraOS itself
+- A filesystem-aware terminal (`ls`, `cd`, `mkdir`, `touch`, `rm`, `cat`,
+  `echo` with `>` file redirection, and a small full-screen `nano`-style
+  editor) — see [kernel/terminal.c](kernel/terminal.c)
+- A syscall ABI (`int 0x80`) that custom-compiled programs use to print
+  text, draw to the screen, read the keyboard, and more — see
+  [kernel/syscall.c](kernel/syscall.c) and
+  [docs/SYSCALLS.md](docs/SYSCALLS.md)
+- A small hand-written x86-64 assembler and flat-binary loader/runner
+  (`compile`/`run` in the terminal) — write a program in auroraOS's
+  assembly language, compile it to real native machine code, and run it,
+  all from inside the OS — see [kernel/asm.c](kernel/asm.c) and
+  [docs/ASSEMBLY.md](docs/ASSEMBLY.md)
+- Minimal freestanding libc (`string.c`, a tiny `printf` with 64-bit
+  (`%llu`/`%lld`/`%llx`) format support)
 - Multiboot memory map + framebuffer info parsing
 - An interactive shell with builtin commands:
-  `help`, `about`, `clear`, `echo`, `mem`, `uptime`, `gui`, `reboot`, `halt`
+  `help`, `about`, `clear`, `mem`, `uptime`, `gui`, `reboot`, `halt`, plus
+  every terminal.c command above
 
 ## The GUI
 
@@ -111,6 +130,64 @@ search panel without picking anything. Apps are registered once in
 `wm_init()`'s `register_app()` calls in [kernel/wm.c](kernel/wm.c); adding
 a new one there automatically makes it searchable too.
 
+## Filesystem, terminal, and custom programs
+
+auroraOS's persistent storage is a second, separate disk from the ISO you
+boot from — the ISO is a read-only CD-ROM image; files need a real
+writable disk. `make disk` creates a blank 64MB raw disk image
+(`auroraos_disk.img`, via [scripts/make_disk.sh](scripts/make_disk.sh));
+`make run` attaches it automatically. The very first boot with a blank
+disk attached formats it as FAT16 (`[boot] No filesystem found;
+formatting disk as FAT16...` in the boot log); every boot after that just
+mounts the existing filesystem, so your files persist across reboots —
+verified by writing a file, rebooting, and reading it back. The disk
+survives `make clean`; run `make clean-disk` if you actually want to wipe
+it back to blank.
+
+The driver looks for the disk on the primary ATA bus's **slave** position
+(port 0x1F0, drive-select bit set) — deliberately not the master, which is
+commonly where a boot CD-ROM's ATAPI drive sits. `make run` attaches it as
+QEMU drive `index=1` with `-boot d` (boot from the CD-ROM first,
+regardless of what a hard disk being present might otherwise default to).
+
+Once at the `aurora:~$` prompt:
+
+```
+aurora:~$ touch hello.txt
+aurora:~$ echo Hello, auroraOS! > hello.txt
+aurora:~$ cat hello.txt
+Hello, auroraOS!
+aurora:~$ ls
+HELLO.TXT  (17 bytes)
+```
+
+`cd` supports exactly one level of subdirectories (`mkdir foo`, `cd foo`,
+`cd ..`) — FAT16 itself supports arbitrary nesting, but only this shallower
+shape has actually been built and tested here, and claiming more would
+be exactly the kind of untested corner this project tries hard to avoid.
+Filenames follow FAT16's classic 8.3 rule (up to 8 characters, an optional
+3-character extension, automatically uppercased) — `mkdir`/`touch`/`echo
+>`/`compile` all report an error rather than silently truncating or
+corrupting a name that doesn't fit.
+
+`nano FILENAME` opens a small full-screen text editor — enough to write or
+revise a short program, deliberately not a full nano clone (there's no
+cursor movement back into earlier text; see the "editing model" note in
+its help line). `Ctrl+S` saves, `Ctrl+X` exits (prompting to save first if
+there are unsaved changes).
+
+`compile SOURCE.asm` assembles auroraOS's own small assembly language
+(documented in full in [docs/ASSEMBLY.md](docs/ASSEMBLY.md)) into a real
+native x86-64 flat binary; `run PROGRAM.bin` executes it directly. There's
+**no process isolation** — a compiled program runs with the same
+privileges as the kernel itself, so a bug in one can genuinely crash or
+corrupt the running OS, the same way a bug in kernel code could. Programs
+talk to the kernel (printing, drawing, reading the keyboard, timing) via a
+real `int 0x80` syscall gate — see [docs/SYSCALLS.md](docs/SYSCALLS.md)
+for the full ABI reference and [docs/RENDERING.md](docs/RENDERING.md) for
+the graphics API those syscalls expose (and the fuller C API underneath,
+for kernel code itself).
+
 ## Requirements
 
 - `gcc` with x86-64 support (`-m64` — the default on essentially any Linux
@@ -146,8 +223,12 @@ dependency entirely but only reliably boots from a CD/DVD.
 ## Running
 
 ```sh
-make run         # boot auroraos.iso through GRUB in QEMU
+make run         # build (if needed) + boot auroraos.iso and auroraos_disk.img in QEMU
 ```
+
+`make run` builds and boots the ISO *and* the persistent data disk
+together (creating `auroraos_disk.img` via `make disk` if it doesn't
+already exist) — see "Filesystem, terminal, and custom programs" above.
 
 This has to boot through GRUB rather than QEMU's built-in `-kernel`
 multiboot loader: the kernel's multiboot header requests a VBE graphics
@@ -186,10 +267,14 @@ installer ISOs use. Concretely:
   Most PCs still support this via a "Legacy Boot" / "CSM" (Compatibility
   Support Module) option in firmware setup — enable that if the drive
   doesn't show up in the boot menu on a UEFI-only machine.
-- It's a real kernel taking over the whole machine: no filesystem access
-  to your existing OS, no way back except a reboot/power cycle. Test in
-  QEMU first (`make run`) if you want to see it before trying real
-  hardware, and don't point it at a drive you care about.
+- It's a real kernel taking over the whole machine: no access to your
+  existing OS's files (auroraOS only reads/writes its own separate FAT16
+  disk — see "Filesystem, terminal, and custom programs" above), no way
+  back except a reboot/power cycle. Test in QEMU first (`make run`) if you
+  want to see it before trying real hardware, and don't point auroraOS's
+  data-disk driver at a real hard drive you care about — it will format
+  whatever's attached at the primary-slave ATA position if that disk
+  doesn't already look like a valid FAT16 volume.
 
 ## Project layout
 
@@ -199,7 +284,15 @@ installer ISOs use. Concretely:
 - [kernel/gdt.c](kernel/gdt.c), [kernel/idt.c](kernel/idt.c),
   [kernel/pic.c](kernel/pic.c) — CPU/interrupt setup
 - [kernel/timer.c](kernel/timer.c), [kernel/keyboard.c](kernel/keyboard.c),
-  [kernel/mouse.c](kernel/mouse.c), [kernel/rtc.c](kernel/rtc.c) — drivers
+  [kernel/mouse.c](kernel/mouse.c), [kernel/rtc.c](kernel/rtc.c),
+  [kernel/ata.c](kernel/ata.c) — drivers
+- [kernel/fat16.c](kernel/fat16.c) — FAT16 filesystem driver
+- [kernel/terminal.c](kernel/terminal.c) — filesystem-aware shell commands
+  (ls/cd/mkdir/touch/rm/cat/echo/nano/compile/run)
+- [kernel/syscall.c](kernel/syscall.c) — the `int 0x80` syscall ABI (see
+  [docs/SYSCALLS.md](docs/SYSCALLS.md))
+- [kernel/asm.c](kernel/asm.c) — the custom x86-64 assembler + flat-binary
+  runner (see [docs/ASSEMBLY.md](docs/ASSEMBLY.md))
 - [kernel/font8x8.c](kernel/font8x8.c) — 8x8 bitmap font (ASCII 0x20-0x7E)
 - [kernel/gfx.c](kernel/gfx.c) — true-color framebuffer graphics primitives
 - [kernel/console.c](kernel/console.c) — software text console (the shell's
@@ -212,17 +305,27 @@ installer ISOs use. Concretely:
 - [kernel/memory.c](kernel/memory.c) — multiboot memory map + framebuffer info
 - [kernel/linker.ld](kernel/linker.ld) — link script (loads at 1 MiB)
 - [scripts/make_iso.sh](scripts/make_iso.sh) — bootable ISO builder
+- [scripts/make_disk.sh](scripts/make_disk.sh) — blank data disk image creator
+- [docs/SYSCALLS.md](docs/SYSCALLS.md), [docs/ASSEMBLY.md](docs/ASSEMBLY.md),
+  [docs/RENDERING.md](docs/RENDERING.md) — reference docs for the syscall
+  ABI, the custom assembly language, and the graphics API
 
 ## What this is (and isn't)
 
-This is a real, from-scratch kernel: it manages its own interrupts, drivers,
-and display — nothing here rides on Linux or any other existing OS. It's a
+This is a real, from-scratch kernel: it manages its own interrupts,
+drivers, filesystem, and display — nothing here rides on Linux or any
+other existing OS, and files it writes are real, verified-correct FAT16
+data (readable by any normal FAT16 tool, not just by auroraOS). It's a
 single-tasking, 64-bit kernel meant as a hobby-OS starting point, not a
-production or multi-user operating system. Paging exists (long mode requires
-it) but only as a flat identity map set up once at boot — there's no
-per-process address space, no demand paging, no filesystem, no process
-scheduler, and no userspace program loader yet. The GUI runs as a blocking
-loop inside the shell rather than a separate process. Multitasking (so the
-GUI and shell, or multiple GUI apps, could run concurrently) and real virtual
-memory (per-process page tables) are natural next steps if you want to keep
-extending it.
+production or multi-user operating system. Paging exists (long mode
+requires it) but only as a flat identity map set up once at boot — there's
+no per-process address space, no memory protection, and no process
+scheduler. Custom-compiled programs run with the same privileges as the
+kernel itself (see [docs/SYSCALLS.md](docs/SYSCALLS.md)'s "Program
+lifecycle" section) rather than in an isolated process — there's no
+concept of a "process" here at all, just the kernel calling directly into
+a program's code and back. The GUI similarly runs as a blocking loop
+inside the shell rather than a separate process. Multitasking (so the GUI
+and shell, or multiple GUI apps or compiled programs, could run
+concurrently) and real memory protection (per-process page tables,
+ring 3 execution) are natural next steps if you want to keep extending it.

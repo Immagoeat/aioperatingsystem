@@ -34,11 +34,12 @@ KERNEL_OBJS_C = $(KERNEL_SRCS_C:.c=.o)
 KERNEL_OBJ_S = kernel/boot.o
 
 ISO = auroraos.iso
+DISK_IMG = auroraos_disk.img
 KERNEL_BIN = kernel_bin/auroraos.bin
 
-.PHONY: all kernel iso run clean wallpapers
+.PHONY: all kernel iso disk run clean wallpapers
 
-all: iso
+all: iso disk
 
 kernel/generated/wallpaper_day.c: assets/wallpapers/auroraosday.png tools/img_to_c.py
 	mkdir -p kernel/generated
@@ -68,18 +69,38 @@ kernel: $(KERNEL_OBJ_S) $(KERNEL_OBJS_C)
 iso: kernel
 	./scripts/make_iso.sh
 
-# Boot the ISO through GRUB. This has to go through GRUB (not QEMU's
-# built-in -kernel multiboot loader): the kernel's multiboot header asks
-# for a VBE graphics mode, and it's GRUB that performs that BIOS video
-# mode call on our behalf before handing off to the kernel. -vga std
-# requests QEMU's standard (non-Cirrus) VGA/VBE emulation, which is what
-# this was developed and tested against. Needs qemu-system-x86_64, not
+# Blank writable disk image for the FAT16 filesystem (see kernel/ata.c,
+# kernel/fat16.c, and scripts/make_disk.sh). Separate from the ISO: the
+# ISO is the read-only CD-ROM boot medium, this is a plain disk auroraOS
+# formats and writes to at runtime. Not regenerated once it exists, so
+# your files survive rebuilding the kernel/ISO.
+disk:
+	./scripts/make_disk.sh
+
+# Boot the ISO through GRUB, with the disk image attached as index=1
+# (primary slave) - verified not to collide with wherever -cdrom puts
+# itself. This has to go through GRUB (not QEMU's built-in -kernel
+# multiboot loader): the kernel's multiboot header asks for a VBE
+# graphics mode, and it's GRUB that performs that BIOS video mode call
+# on our behalf before handing off to the kernel. -vga std requests
+# QEMU's standard (non-Cirrus) VGA/VBE emulation, which is what this
+# was developed and tested against. Needs qemu-system-x86_64, not
 # qemu-system-i386: the kernel switches itself into 64-bit long mode
 # early in boot.s, which an i386-only CPU model can't execute at all.
-run: iso
-	qemu-system-x86_64 -cdrom $(ISO) -vga std
+# -boot d forces booting from the CD-ROM first: without it, some
+# BIOS/QEMU version combinations prefer booting from the hard disk once
+# one is attached, which would try (and fail) to boot the blank/FAT16
+# data disk instead of auroraOS itself.
+run: iso disk
+	qemu-system-x86_64 -cdrom $(ISO) -vga std -drive file=$(DISK_IMG),format=raw,if=ide,index=1 -boot d
 
 clean:
 	rm -f kernel/*.o
 	rm -rf kernel_bin build kernel/generated
 	rm -f $(ISO)
+
+# Deliberately NOT part of `clean`: the disk image holds the user's
+# files across rebuilds. Remove it explicitly (and re-run `make disk`)
+# to reset the filesystem to blank.
+clean-disk:
+	rm -f $(DISK_IMG)

@@ -12,7 +12,45 @@ typedef uint32_t gfx_color_t; /* 0x00RRGGBB */
 uint8_t inb(uint16_t port);
 void outb(uint16_t port, uint8_t val);
 uint16_t inw(uint16_t port);
+void outw(uint16_t port, uint16_t val);
 void io_wait(void);
+
+/* --- ata.c: polling PIO ATA disk driver (primary bus, master drive) --- */
+bool ata_init(void);
+bool ata_is_present(void);
+uint32_t ata_get_total_sectors(void);
+bool ata_read_sector(uint32_t lba, uint8_t *buf512);
+bool ata_write_sector(uint32_t lba, const uint8_t *buf512);
+
+/* --- asm.c: assembler + runner for auroraOS's custom instruction set
+ * (see docs/ASSEMBLY.md). asm_assemble() encodes `source` into machine
+ * code in out_code (capacity out_capacity), returning the encoded
+ * length via out_len; on failure returns false and fills out_error /
+ * out_error_line. asm_run() executes an already-assembled buffer
+ * directly - no isolation from the kernel, see asm.c's file comment. */
+bool asm_assemble(const char *source, uint8_t *out_code, uint32_t out_capacity, uint32_t *out_len, char *out_error, int *out_error_line);
+uint64_t asm_run(const uint8_t *code, uint32_t len);
+extern uint64_t asm_last_exit_code; /* set by SYS_EXIT; see syscall.c */
+
+/* --- fat16.c: FAT16 filesystem driver --- */
+struct fat16_entry {
+	char name[13]; /* "NAME.EXT\0" */
+	bool is_dir;
+	uint32_t size;
+	uint16_t first_cluster;
+};
+typedef void (*fat16_list_callback)(const char *name, bool is_dir, uint32_t size, void *userdata);
+
+bool fat16_mount(void);
+bool fat16_is_mounted(void);
+bool fat16_format(uint32_t disk_sectors);
+void fat16_list(uint16_t dir_cluster, fat16_list_callback cb, void *userdata);
+bool fat16_stat(uint16_t dir_cluster, const char *name, struct fat16_entry *out);
+bool fat16_create(uint16_t dir_cluster, const char *name, bool as_directory);
+bool fat16_delete(uint16_t dir_cluster, const char *name);
+uint32_t fat16_read_file(uint16_t first_cluster, uint32_t file_size, uint32_t offset, void *out, uint32_t max_len);
+bool fat16_write_file(uint16_t dir_cluster, const char *name, const void *data, uint32_t len);
+#define FAT16_ROOT_CLUSTER 0
 
 /* --- console.c: software text console rendered on the graphics
  * framebuffer (there is no separate hardware text mode once we boot
@@ -61,6 +99,28 @@ struct registers {
 typedef void (*isr_t)(struct registers *);
 void register_interrupt_handler(uint8_t n, isr_t handler);
 
+/* --- syscall.c: the syscall ABI custom-compiled programs use to call
+ * into the kernel (see docs/SYSCALLS.md for the full reference). Number
+ * goes in rax, up to 4 args in rdi/rsi/rdx/r10, return value in rax,
+ * invoked via `int 0x80`. --- */
+#define SYS_EXIT         0
+#define SYS_WRITE_CHAR   1
+#define SYS_WRITE_STR    2
+#define SYS_WRITE_INT    3
+#define SYS_READ_CHAR    4
+#define SYS_HAS_KEY      5
+#define SYS_GFX_SET_EXTRA 6
+#define SYS_GFX_PIXEL    7
+#define SYS_GFX_RECT     8
+#define SYS_GFX_LINE     9
+#define SYS_GFX_TEXT     10
+#define SYS_GFX_FLIP     11
+#define SYS_GFX_WIDTH    12
+#define SYS_GFX_HEIGHT   13
+#define SYS_GET_TICKS    14
+#define SYS_SLEEP_TICKS  15
+void syscall_dispatch(struct registers *regs);
+
 /* --- pic.c --- */
 void pic_remap(void);
 void pic_send_eoi(uint8_t irq);
@@ -90,6 +150,13 @@ bool keyboard_has_key(void);
 
 /* --- shell.c --- */
 void shell_run(void);
+
+/* --- terminal.c: filesystem-aware commands (ls, cd, touch, rm, cat,
+ * mkdir, echo with redirection, nano, compile, run). Returns false if
+ * `cmd` isn't one it handles, so shell.c's dispatch() can fall through
+ * to its own commands / the "unknown command" message. */
+bool terminal_dispatch(const char *cmd, char *rest);
+void terminal_print_cwd_prompt_suffix(void);
 
 /* --- memory.c --- */
 struct fb_info {

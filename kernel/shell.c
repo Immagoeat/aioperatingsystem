@@ -8,7 +8,9 @@ static void print_prompt(void) {
 	console_set_color(GFX_RGB(0x5C, 0xE1, 0x9C));
 	console_writestring("aurora");
 	console_set_color(console_color_default());
-	console_writestring(":~$ ");
+	console_writestring(":~");
+	terminal_print_cwd_prompt_suffix();
+	console_writestring("$ ");
 	console_present();
 }
 
@@ -37,15 +39,27 @@ static void read_line(char *buf, size_t max_len) {
 
 static void cmd_help(void) {
 	console_writestring("Available commands:\n");
-	console_writestring("  help      - show this help message\n");
-	console_writestring("  about     - about auroraOS\n");
-	console_writestring("  clear     - clear the screen\n");
-	console_writestring("  echo TXT  - print TXT back\n");
-	console_writestring("  mem       - show memory map / totals\n");
-	console_writestring("  uptime    - show timer ticks since boot\n");
-	console_writestring("  gui       - launch the graphical desktop (Ctrl+Q to exit)\n");
-	console_writestring("  reboot    - reboot the machine\n");
-	console_writestring("  halt      - halt the CPU\n");
+	console_writestring("  help          - show this help message\n");
+	console_writestring("  about         - about auroraOS\n");
+	console_writestring("  clear         - clear the screen\n");
+	console_writestring("  mem           - show memory map / totals\n");
+	console_writestring("  uptime        - show timer ticks since boot\n");
+	console_writestring("  gui           - launch the graphical desktop (Ctrl+Q to exit)\n");
+	console_writestring("  reboot        - reboot the machine\n");
+	console_writestring("  halt          - halt the CPU\n");
+	console_writestring("\nFilesystem (needs a data disk; see README):\n");
+	console_writestring("  ls                    - list files in the current directory\n");
+	console_writestring("  cd NAME | cd ..       - change directory (one level deep)\n");
+	console_writestring("  mkdir NAME            - create a directory (from root only)\n");
+	console_writestring("  touch NAME            - create an empty file\n");
+	console_writestring("  rm NAME               - delete a file or empty directory\n");
+	console_writestring("  cat NAME              - print a file's contents\n");
+	console_writestring("  echo TEXT             - print TEXT back\n");
+	console_writestring("  echo TEXT > NAME      - write TEXT to a file\n");
+	console_writestring("  nano NAME             - edit a file (Ctrl+S save, Ctrl+X exit)\n");
+	console_writestring("\nCustom programs (see docs/ASSEMBLY.md, docs/SYSCALLS.md):\n");
+	console_writestring("  compile SRC.asm       - assemble SRC.asm to SRC.bin\n");
+	console_writestring("  run PROGRAM.bin       - run a compiled program\n");
 }
 
 static void cmd_about(void) {
@@ -116,16 +130,17 @@ static void dispatch(char *line) {
 	char *cmd = strtok_simple(line, ' ', &saveptr);
 	if (!cmd) return;
 
+	char *rest = strtok_simple(NULL, '\0', &saveptr);
+
 	if (strcmp(cmd, "help") == 0) {
 		cmd_help();
 	} else if (strcmp(cmd, "about") == 0) {
 		cmd_about();
 	} else if (strcmp(cmd, "clear") == 0) {
 		console_clear();
-	} else if (strcmp(cmd, "echo") == 0) {
-		char *rest = strtok_simple(NULL, '\0', &saveptr);
-		if (rest) console_writestring(rest);
-		console_putchar('\n');
+	} else if (terminal_dispatch(cmd, rest)) {
+		/* handled by terminal.c: ls, cd, touch, rm, cat, mkdir, echo,
+		 * nano, compile, run */
 	} else if (strcmp(cmd, "mem") == 0) {
 		memory_print_map();
 	} else if (strcmp(cmd, "uptime") == 0) {

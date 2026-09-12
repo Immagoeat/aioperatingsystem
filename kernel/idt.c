@@ -36,6 +36,8 @@ extern void irq4(void);  extern void irq5(void);  extern void irq6(void);  exter
 extern void irq8(void);  extern void irq9(void);  extern void irq10(void); extern void irq11(void);
 extern void irq12(void); extern void irq13(void); extern void irq14(void); extern void irq15(void);
 
+extern void isr128(void); /* syscall gate, see syscall.c */
+
 static void idt_set_gate(uint8_t num, uint64_t base, uint16_t sel, uint8_t flags) {
 	idt[num].base_low = base & 0xFFFF;
 	idt[num].base_mid = (base >> 16) & 0xFFFF;
@@ -55,6 +57,11 @@ static const char *exception_messages[] = {
 };
 
 void isr_handler(struct registers *regs) {
+	if (regs->int_no == 128) {
+		syscall_dispatch(regs);
+		return;
+	}
+
 	if (regs->int_no < 20) {
 		kprintf("\n[EXCEPTION] %s (int %d, err %d)\n", exception_messages[regs->int_no], (int)regs->int_no, (int)regs->err_code);
 		kprintf("System halted.\n");
@@ -121,6 +128,15 @@ void idt_install(void) {
 	idt_set_gate(45, (uint64_t)(uintptr_t)irq13, 0x08, 0x8E);
 	idt_set_gate(46, (uint64_t)(uintptr_t)irq14, 0x08, 0x8E);
 	idt_set_gate(47, (uint64_t)(uintptr_t)irq15, 0x08, 0x8E);
+
+	/* Syscall gate: DPL=3 (flags 0xEE, vs 0x8E's DPL=0 for everything
+	 * else) so it's callable via `int 0x80` from a lower privilege
+	 * level, matching how a real syscall gate works, even though this
+	 * kernel doesn't yet run anything in ring 3 - custom-compiled
+	 * programs execute in ring 0 today (see asm.c), so this makes no
+	 * practical difference right now but is the architecturally correct
+	 * setting to already have in place. */
+	idt_set_gate(128, (uint64_t)(uintptr_t)isr128, 0x08, 0xEE);
 
 	idt_flush(&ip);
 }

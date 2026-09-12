@@ -228,6 +228,13 @@ ISR_NOERR 17
 ISR_NOERR 18
 ISR_NOERR 19
 
+/* Software interrupt used as the syscall gate (see syscall.c). Not a
+ * CPU exception, so it's a separate vector from 0-19, but reuses the
+ * same isr_common_stub - the C-level isr_handler() tells vector 0x80
+ * apart from a real exception by int_no and routes it to the syscall
+ * dispatcher instead of the "fatal exception" path. */
+ISR_NOERR 128
+
 .macro IRQ num, remapped
 .global irq\remapped
 irq\remapped:
@@ -362,4 +369,33 @@ gdt_flush:
 .global idt_flush
 idt_flush:
 	lidt (%rdi)
+	ret
+
+/* --- run a custom-assembled flat binary (see asm.c) ---
+ * Saves every callee-saved register the System V ABI requires a
+ * function to preserve, calls into the program buffer (address in
+ * %rdi, per the calling convention), then restores them - so a
+ * well-behaved program that returns via `ret` comes back to C code
+ * with the kernel's own register state intact rather than whatever the
+ * program left in rbx/rbp/r12-r15. This does NOT protect against a
+ * buggy program corrupting memory, jumping somewhere invalid, or
+ * disabling interrupts and never returning - there is no isolation
+ * here by design (see asm.c's comment on this). */
+.global asm_run_trampoline
+asm_run_trampoline:
+	push %rbx
+	push %rbp
+	push %r12
+	push %r13
+	push %r14
+	push %r15
+
+	call *%rdi
+
+	pop %r15
+	pop %r14
+	pop %r13
+	pop %r12
+	pop %rbp
+	pop %rbx
 	ret

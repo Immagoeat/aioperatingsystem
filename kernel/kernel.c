@@ -62,6 +62,23 @@ void kernel_main(void) {
 	kprintf("[boot] Enabling interrupts...\n");
 	__asm__ volatile("sti");
 
+	kprintf("[boot] Detecting data disk...\n");
+	if (ata_init()) {
+		if (fat16_mount()) {
+			kprintf("[boot] FAT16 filesystem mounted.\n");
+		} else {
+			kprintf("[boot] No filesystem found; formatting disk as FAT16...\n");
+			uint32_t sectors = ata_get_total_sectors();
+			if (fat16_format(sectors) && fat16_mount()) {
+				kprintf("[boot] Disk formatted and mounted.\n");
+			} else {
+				kprintf("[boot] Disk format failed; file commands will be unavailable.\n");
+			}
+		}
+	} else {
+		kprintf("[boot] No data disk found; file commands will be unavailable.\n");
+	}
+
 	kprintf("[boot] Total memory: %u KB\n", memory_total_kb());
 	kprintf("\nauroraOS is ready.\n");
 	console_set_color(console_color_dim());
