@@ -164,6 +164,11 @@ bool keyboard_has_key(void);
 
 /* --- shell.c --- */
 void shell_run(void);
+/* Launches the shell as a GUI app (see wm.c's "Terminal"): same
+ * commands as the top-level shell, but with `exit` in place of `gui`.
+ * Caller is responsible for switching graphics modes before/after,
+ * same as the shell (Ctrl+Q) and Text Editor already do. */
+void terminal_app_run(void);
 
 /* --- terminal.c: filesystem-aware commands (ls, cd, touch, rm, cat,
  * mkdir, echo with redirection, nano, compile, run). Returns false if

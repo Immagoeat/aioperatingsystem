@@ -35,8 +35,10 @@ modern windowed desktop GUI a `gui` command away.
   legacy VGA text mode in this design — see [kernel/console.c](kernel/console.c))
 - A modern-flat-design windowing GUI: soft shadows, rounded corners,
   macOS-style traffic-light window controls, swappable desktop wallpapers,
-  a taskbar with a live wall-clock, an app-launcher search bar, and a few
-  demo apps (About, an animated uptime counter, a color palette viewer)
+  a taskbar with a live wall-clock, a keyboard-navigable app-launcher search
+  bar, a few demo apps (About, an animated uptime counter, a color palette
+  viewer), plus a real Text Editor (nano) and Terminal (the same shell as
+  the text-mode prompt) that both run full-screen over the desktop
   — see [kernel/wm.c](kernel/wm.c)
 - Swappable wallpapers baked in at build time from
   [assets/wallpapers/](assets/wallpapers/) — see [kernel/wallpaper.c](kernel/wallpaper.c)
@@ -74,10 +76,12 @@ modern windowed desktop GUI a `gui` command away.
 
 The desktop launches automatically 3 seconds after the shell starts —
 press any key during the countdown to cancel it and stay at the text
-prompt instead, or type `gui` yourself at any time. Move the mouse to
-control the cursor, drag windows by their title bars, and click a window
-(or its taskbar button) to bring it to the front. Press `Ctrl+Q` on the
-keyboard to return to the text shell at any time.
+prompt instead, or type `gui` yourself at any time. It boots to an empty
+screen — nothing is auto-launched — so open what you want via the search
+bar. Move the mouse to control the cursor, drag windows by their title
+bars, and click a window (or its taskbar button) to bring it to the
+front. Press `Ctrl+Q` on the keyboard to return to the text shell at any
+time.
 
 Each window has the familiar three title-bar dots: red closes it, yellow
 minimizes it (it drops to a taskbar button — click that button again to
@@ -122,13 +126,36 @@ once a second in [kernel/wm.c](kernel/wm.c)'s taskbar drawing code via
 ### Search
 
 Press `/` or click the magnifying-glass button in the taskbar to open the
-app search bar. Type to filter the demo apps by name (case-insensitive,
-matches anywhere in the name), press `Enter` or click a result to jump to
-it — raising it if it's already open, or (re)launching it if it was
-closed, the same way a real OS's app launcher works. `Escape` closes the
-search panel without picking anything. Apps are registered once in
-`wm_init()`'s `register_app()` calls in [kernel/wm.c](kernel/wm.c); adding
-a new one there automatically makes it searchable too.
+app search bar. Type to filter apps by name (case-insensitive, matches
+anywhere in the name), use `Up`/`Down` to move the highlighted result, and
+press `Enter` (or click a result) to launch it — raising it if it's
+already open, or (re)launching it if it was closed, the same way a real
+OS's app launcher works. `Escape` closes the search panel without picking
+anything. Apps are registered once in `wm_init()`'s `register_app()` /
+`register_console_app()` calls in [kernel/wm.c](kernel/wm.c); adding a new
+one there automatically makes it searchable too.
+
+### Text Editor and Terminal
+
+Two of the searchable apps aren't drawn as windows: **Text Editor** and
+**Terminal** are "console apps" that take over the whole screen using the
+same software console the text-mode shell uses, rather than being painted
+into a window on the desktop. Launching one suspends the desktop (the same
+switch `Ctrl+Q` does), runs full-screen, and restores the desktop exactly
+as it was on exit.
+
+- **Text Editor** prompts for a filename (created if it doesn't exist,
+  relative to the filesystem root) and opens it in the same `nano`-style
+  editor described below.
+- **Terminal** drops into the same shell as the text-mode prompt —
+  identical commands, same real FAT16 filesystem — except `exit` takes
+  its place of `gui` (you're already inside the desktop; `exit` returns to
+  it instead of recursing into another copy of it).
+
+See `run_console_app()` / `is_console_app` in [kernel/wm.c](kernel/wm.c)
+and `terminal_launch_nano_from_gui()` / `terminal_app_run()` in
+[kernel/terminal.c](kernel/terminal.c) and
+[kernel/shell.c](kernel/shell.c).
 
 ## Filesystem, terminal, and custom programs
 

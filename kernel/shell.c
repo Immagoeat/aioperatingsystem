@@ -41,14 +41,18 @@ static void read_line(char *buf, size_t max_len) {
 	}
 }
 
-static void cmd_help(void) {
+static void cmd_help(bool from_gui) {
 	console_writestring("Available commands:\n");
 	console_writestring("  help          - show this help message\n");
 	console_writestring("  about         - about auroraOS\n");
 	console_writestring("  clear         - clear the screen\n");
 	console_writestring("  mem           - show memory map / totals\n");
 	console_writestring("  uptime        - show timer ticks since boot\n");
-	console_writestring("  gui           - launch the graphical desktop (Ctrl+Q to exit)\n");
+	if (from_gui) {
+		console_writestring("  exit          - return to the desktop\n");
+	} else {
+		console_writestring("  gui           - launch the graphical desktop (Ctrl+Q to exit)\n");
+	}
 	console_writestring("  reboot        - reboot the machine\n");
 	console_writestring("  halt          - halt the CPU\n");
 	console_writestring("\nFilesystem (needs a data disk; see README):\n");
@@ -129,7 +133,13 @@ static void auto_launch_countdown(void) {
 	launch_gui();
 }
 
-static void dispatch(char *line) {
+/* from_gui: true when this shell session is a "Terminal" app window
+ * running inside the desktop (see wm.c) rather than the top-level shell
+ * booted straight from the kernel. Changes two things: `gui` isn't
+ * offered (you're already inside the desktop - re-entering wm_run()
+ * from here would recurse into it instead of returning to it), and
+ * `exit` is offered instead to return control to the desktop. */
+static void dispatch(char *line, bool from_gui, bool *should_exit) {
 	char *saveptr;
 	char *cmd = strtok_simple(line, ' ', &saveptr);
 	if (!cmd) return;
@@ -137,7 +147,7 @@ static void dispatch(char *line) {
 	char *rest = strtok_simple(NULL, '\0', &saveptr);
 
 	if (strcmp(cmd, "help") == 0) {
-		cmd_help();
+		cmd_help(from_gui);
 	} else if (strcmp(cmd, "about") == 0) {
 		cmd_about();
 	} else if (strcmp(cmd, "clear") == 0) {
@@ -149,7 +159,9 @@ static void dispatch(char *line) {
 		memory_print_map();
 	} else if (strcmp(cmd, "uptime") == 0) {
 		kprintf("Ticks since boot: %u (~%u sec)\n", timer_get_ticks(), timer_get_ticks() / 100);
-	} else if (strcmp(cmd, "gui") == 0) {
+	} else if (from_gui && strcmp(cmd, "exit") == 0) {
+		*should_exit = true;
+	} else if (!from_gui && strcmp(cmd, "gui") == 0) {
 		launch_gui();
 	} else if (strcmp(cmd, "reboot") == 0) {
 		console_writestring("Rebooting...\n");
@@ -175,9 +187,32 @@ static void dispatch(char *line) {
 void shell_run(void) {
 	auto_launch_countdown();
 
+	bool should_exit = false; /* unused at the top level - nothing to exit to */
 	for (;;) {
 		print_prompt();
 		read_line(cmd_buffer, CMD_BUFFER_SIZE);
-		dispatch(cmd_buffer);
+		dispatch(cmd_buffer, false, &should_exit);
 	}
+}
+
+/* Entry point for launching a shell as a GUI app (see wm.c's "Terminal"
+ * app): the same command set as the top-level shell, minus the countdown
+ * (nothing to auto-boot into - we're already in the desktop) and with
+ * `exit` in place of `gui`, so the user has a way back to the desktop
+ * instead of recursing into another copy of it. wm.c is responsible for
+ * switching graphics modes before/after calling this, the same way it
+ * already does for the Text Editor app. */
+void terminal_app_run(void) {
+	static char nested_cmd_buffer[CMD_BUFFER_SIZE];
+	console_clear();
+	console_writestring("auroraOS Terminal - type 'exit' to return to the desktop.\n\n");
+
+	bool should_exit = false;
+	while (!should_exit) {
+		print_prompt();
+		read_line(nested_cmd_buffer, CMD_BUFFER_SIZE);
+		dispatch(nested_cmd_buffer, true, &should_exit);
+	}
+
+	console_clear();
 }
