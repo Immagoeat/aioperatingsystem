@@ -71,7 +71,7 @@ static void cmd_about(void) {
 	console_writestring("\n  auroraOS - a tiny hobby kernel\n");
 	console_set_color(console_color_default());
 	console_writestring("  ------------------------------\n");
-	console_writestring("  32-bit, multiboot, x86, written in C + assembly.\n");
+	console_writestring("  64-bit, multiboot, x86, written in C + assembly.\n");
 	console_writestring("  Boots into a VBE linear framebuffer via GRUB.\n");
 	console_writestring("  Features: GDT, IDT, PIC remap, PIT timer,\n");
 	console_writestring("  PS/2 keyboard + mouse drivers, a software\n");
