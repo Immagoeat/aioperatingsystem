@@ -35,7 +35,38 @@ set default=0
 insmod iso9660
 insmod biosdisk
 
+# Auto-detect the display's best available resolution rather than
+# forcing a fixed mode: `gfxmode=auto` has GRUB enumerate the VBE modes
+# the BIOS actually reports for this display (including EDID-reported
+# modes, when the BIOS exposes them) and pick the highest usable one,
+# and `gfxpayload=keep` tells GRUB to hand that already-set mode
+# straight to the kernel instead of renegotiating down to whatever
+# fixed width/height the Multiboot header asks for (boot.s's request is
+# now just a fallback for the rare setup where gfxpayload didn't take).
+insmod vbe
+insmod video
+set gfxmode=auto
+set gfxpayload=keep
+
+# Real (not simulated) OTA-style update path: the boot ISO itself is a
+# read-only CD-ROM image, so a running auroraOS can't rewrite what it
+# booted from - but it CAN write a new kernel binary to its writable
+# FAT16 data disk (see kernel/updatecmd.c's `update` command). GRUB
+# looks for that file, on ANY attached disk, before falling back to the
+# kernel baked into this ISO. `search` here doesn't error out if the
+# file isn't found (unlike the required `search` below for the ISO's
+# own kernel) - it just leaves $root unset, which the `if` catches.
+insmod fat
+insmod part_msdos
+
 menuentry "auroraOS" {
+	search --no-floppy --set=root --file /AURORAOS.UPD || true
+	if [ -n "$root" ]; then
+		echo "Found an update on the data disk - booting it."
+		multiboot /AURORAOS.UPD
+		boot
+	fi
+
 	search --no-floppy --set=root --file /boot/auroraos.bin
 	multiboot /boot/auroraos.bin
 	boot

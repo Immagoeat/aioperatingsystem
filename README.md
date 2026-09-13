@@ -16,9 +16,16 @@ modern windowed desktop GUI a `gui` command away.
   near the 4GB boundary), enables PAE, sets the long-mode bit in the EFER
   MSR, turns on paging, and far-jumps into a 64-bit code segment before any
   other kernel code runs
-- GRUB-negotiated VBE graphics mode (1024x768x32 requested via the Multiboot
-  video-mode header fields; GRUB performs the actual BIOS video call before
-  handing off to the kernel) — see [kernel/boot.s](kernel/boot.s)
+- Auto-detected VBE graphics mode: `gfxmode=auto`/`gfxpayload=keep` in
+  [scripts/make_iso.sh](scripts/make_iso.sh)'s grub.cfg have GRUB itself
+  enumerate the real VBE modes this display reports (checking EDID where the
+  BIOS exposes it) and pick the best one, handing that already-active mode
+  straight to the kernel; the Multiboot header's fixed 1024x768 request in
+  [kernel/boot.s](kernel/boot.s) is now just a fallback for the rare case
+  where that doesn't take. There's no real GPU driver behind any of this
+  though (just VBE's linear framebuffer handoff), so independent
+  multi-monitor output isn't achievable here — GRUB/VBE hands off exactly
+  one framebuffer, whichever display it decided was primary.
 - Global Descriptor Table (GDT) setup
 - Interrupt Descriptor Table (IDT) with ISR/IRQ stubs for CPU exceptions and
   hardware interrupts
@@ -71,6 +78,17 @@ modern windowed desktop GUI a `gui` command away.
 - An interactive shell with builtin commands:
   `help`, `about`, `clear`, `mem`, `uptime`, `gui`, `reboot`, `halt`, plus
   every terminal.c command above
+- Real PCI configuration-space enumeration ([kernel/pci.c](kernel/pci.c)) and
+  an honest network-status panel in the taskbar ([kernel/netinfo.c](kernel/netinfo.c)):
+  it detects whatever real network controller is actually attached (no
+  network stack, no Wi-Fi driver, no fake "Connected" state — see the
+  Network section below)
+- A real (not simulated) update mechanism given the constraint that there's
+  no network stack to fetch updates over: an `update` command
+  ([kernel/updatecmd.c](kernel/updatecmd.c)) validates and installs a staged
+  kernel binary onto the writable data disk, and GRUB is configured to boot
+  it automatically on the next restart instead of the ISO's built-in kernel
+  (see the Updates section below)
 
 ## The GUI
 
@@ -171,6 +189,48 @@ offset from a list of named zones (arrows move, Enter selects, Escape
 cancels) if the clock looks wrong. The offset is applied once, centrally,
 inside `rtc_get_time()` in [kernel/rtc.c](kernel/rtc.c), so the taskbar
 clock (and anything else that reads the time) reflects it automatically.
+
+### Network
+
+Real Wi-Fi (scanning networks, WPA handshakes, per-chipset firmware-
+dependent drivers) is thousands of lines of work and not something
+auroraOS fakes. What it does instead is real: [kernel/pci.c](kernel/pci.c)
+enumerates PCI configuration space (the standard 0xCF8/0xCFC mechanism) and
+looks for any class-0x02 (network) controller, cross-referencing a small
+table of chipsets it can name (QEMU's emulated e1000/rtl8139/virtio-net,
+plus a couple of common real wired NICs). [kernel/netinfo.c](kernel/netinfo.c)
+turns that into a simple status the network icon in the taskbar reflects -
+click it to see what was actually found. There's no network stack behind
+any of it (no driver, no TCP/IP), and the panel says so plainly rather than
+showing a fake "Connected" state; if a device isn't in the known-chipset
+table it still shows up, just labeled by its raw vendor:device ID.
+
+### Updates
+
+auroraOS boots from a read-only CD-ROM image (`auroraos.iso`) - nothing
+running inside it can rewrite that. What it CAN do is write to its own
+writable FAT16 data disk, and GRUB (see the `grub.cfg` generated in
+[scripts/make_iso.sh](scripts/make_iso.sh)) is configured to look there
+first: `search --no-floppy --set=root --file /AURORAOS.UPD` on any attached
+disk, booting that if found, falling back to the ISO's built-in kernel
+otherwise.
+
+The `update` command ([kernel/updatecmd.c](kernel/updatecmd.c)) is what
+gets a new kernel there: it looks for a staged file named `NEWKRNL.BIN` at
+the root of the data disk, checks it actually starts with a real Multiboot
+header (so it won't install garbage), and if valid, writes it as
+`/AURORAOS.UPD` - the exact file GRUB checks for. `reboot` (or a normal
+restart) then boots straight into it.
+
+The one honest limitation: auroraOS has no network or USB mass-storage
+driver yet, so there's no way for it to fetch `NEWKRNL.BIN` from anywhere
+on its own. Getting a new kernel build onto the data disk today means
+copying it there from the host machine - the same way the disk image
+itself gets created (e.g. with mtools' `mcopy -i auroraos_disk.img
+kernel_bin/auroraos.bin ::NEWKRNL.BIN`, or by mounting the image directly).
+Once it's there, `update` and the reboot are real, not simulated - this was
+verified end-to-end (install, reboot, GRUB finding and booting the new
+kernel from the data disk, filesystem left intact).
 
 ## Filesystem, terminal, and custom programs
 

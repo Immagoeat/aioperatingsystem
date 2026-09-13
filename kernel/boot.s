@@ -23,8 +23,15 @@
  * the AOUT_KLUDGE flag */
 .long 0, 0, 0, 0, 0
 /* video mode request: mode_type=0 (linear graphics), width, height, depth.
- * GRUB performs the VBE BIOS call for us before starting the kernel and
- * hands back the framebuffer address via the multiboot info structure. */
+ * This is only a fallback now: grub.cfg sets `gfxmode=auto` and
+ * `gfxpayload=keep` before calling `multiboot`, which has GRUB itself
+ * auto-detect and switch to the display's best real VBE mode (checking
+ * EDID where the BIOS exposes it) and then hand that already-active
+ * mode straight to us - so this fixed 1024x768 request only matters on
+ * a setup where gfxpayload didn't take for some reason. Either way,
+ * GRUB performs the actual VBE BIOS call and hands back the resulting
+ * framebuffer address via the multiboot info structure; gfx.c reads
+ * whatever real width/height that turns out to be, not this request. */
 .long 0
 .long 1024
 .long 768

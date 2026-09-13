@@ -82,6 +82,19 @@ static uint32_t root_dir_sectors;
 static uint32_t data_start_lba;
 static uint32_t total_clusters;
 
+/* "Next fit" search hint for fat_find_free_cluster(): without this, a
+ * file needing N clusters costs O(N^2) FAT reads (each allocation
+ * rescans from cluster 2, re-checking every cluster already handed
+ * out this session) - fine for the small text files this was
+ * originally exercised with, but this genuinely hangs (not just
+ * "slow") for a multi-megabyte file like an OS update image, which is
+ * exactly the case that surfaced it. Remembering where the last
+ * allocation succeeded and resuming from there next time makes a
+ * large sequential allocation O(N) instead, the same fix every real
+ * FAT driver's allocator makes. Purely a search-order optimization -
+ * doesn't change the on-disk format or FAT semantics at all. */
+static uint16_t next_free_cluster_hint = 2;
+
 /* --- low-level sector helpers --- */
 
 static bool read_sector(uint32_t lba, uint8_t *buf) {
@@ -131,9 +144,27 @@ static bool fat_write_entry(uint16_t cluster, uint16_t value) {
 }
 
 static uint16_t fat_find_free_cluster(void) {
-	/* Clusters 0 and 1 are reserved; valid data clusters start at 2. */
-	for (uint16_t c = 2; c < total_clusters + 2; c++) {
-		if (fat_read_entry(c) == FAT16_FREE_CLUSTER) return c;
+	/* Clusters 0 and 1 are reserved; valid data clusters start at 2.
+	 * Start from the hint (see its declaration) and wrap around once,
+	 * so clusters freed earlier (e.g. by rm/overwrite) before the hint
+	 * are still found - this always checks every cluster exactly once
+	 * per call, same as the original linear scan, just starting from a
+	 * different point. */
+	uint16_t last = (uint16_t)(total_clusters + 2);
+	for (uint16_t c = next_free_cluster_hint; c < last; c++) {
+		if (fat_read_entry(c) == FAT16_FREE_CLUSTER) {
+			/* caller (extend_cluster_chain) is about to mark this
+			 * cluster used, so the next search can safely start past
+			 * it rather than re-checking it */
+			next_free_cluster_hint = (uint16_t)(c + 1);
+			return c;
+		}
+	}
+	for (uint16_t c = 2; c < next_free_cluster_hint && c < last; c++) {
+		if (fat_read_entry(c) == FAT16_FREE_CLUSTER) {
+			next_free_cluster_hint = (uint16_t)(c + 1);
+			return c;
+		}
 	}
 	return 0; /* 0 = no free cluster (never a valid data cluster number) */
 }
@@ -170,6 +201,7 @@ bool fat16_mount(void) {
 	uint32_t data_sectors = total_sectors - data_start_lba;
 	total_clusters = bpb.sectors_per_cluster ? data_sectors / bpb.sectors_per_cluster : 0;
 
+	next_free_cluster_hint = 2; /* fresh mount: no basis for assuming anything past here is more likely free */
 	mounted = true;
 	return true;
 }
@@ -261,6 +293,7 @@ bool fat16_format(uint32_t disk_sectors) {
 	fat_write_entry(0, 0xFF00 | bpb.media_type);
 	fat_write_entry(1, 0xFFFF);
 
+	next_free_cluster_hint = 2; /* every cluster is free on a freshly formatted volume */
 	mounted = true;
 	return true;
 }

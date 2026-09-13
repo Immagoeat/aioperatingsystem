@@ -13,7 +13,33 @@ uint8_t inb(uint16_t port);
 void outb(uint16_t port, uint8_t val);
 uint16_t inw(uint16_t port);
 void outw(uint16_t port, uint16_t val);
+uint32_t inl(uint16_t port);
+void outl(uint16_t port, uint32_t val);
 void io_wait(void);
+
+/* --- pci.c: PCI configuration-space enumeration (legacy 0xCF8/0xCFC
+ * mechanism). Just detection/identification - there's no PCI driver
+ * framework here, and deliberately no fake network drivers behind it;
+ * see pci.c and netinfo.c's file comments. --- */
+struct pci_network_device {
+	uint8_t bus, device, function;
+	uint16_t vendor_id, device_id;
+	bool is_wireless_class; /* PCI subclass 0x80 ("Other"), which is how Wi-Fi adapters identify themselves - PCI has no Wi-Fi-specific class code */
+	const char *known_name; /* NULL if not in pci.c's small known-chipset table */
+};
+typedef void (*pci_device_callback)(const struct pci_network_device *dev, void *userdata);
+void pci_find_network_controllers(pci_device_callback cb, void *userdata);
+
+/* --- netinfo.c: honest network hardware status for the GUI's network
+ * panel. No stack, no driver, no Wi-Fi - just "is a network controller
+ * actually present, and what is it" (see netinfo.c's file comment). --- */
+struct netinfo_status {
+	bool hardware_found;
+	bool is_wireless;
+	char name[48];
+};
+void netinfo_scan(void); /* re-enumerates PCI; call once at GUI startup, or on demand from the panel */
+bool netinfo_get(struct netinfo_status *out); /* returns the same as its bool return: whether hardware was found */
 
 /* --- ata.c: polling PIO ATA disk driver (primary bus, master drive) --- */
 bool ata_init(void);
@@ -195,6 +221,11 @@ void terminal_print_cwd_prompt_suffix(void);
  * responsible for switching graphics modes before/after, same as the
  * shell (Ctrl+Q) already does. */
 void terminal_launch_nano_from_gui(void);
+
+/* --- updatecmd.c: a real (not simulated) update mechanism given the
+ * constraint that there's no network stack to fetch updates over - see
+ * updatecmd.c's file comment for exactly what it does and doesn't do. --- */
+void updatecmd_run(void);
 
 /* --- memory.c --- */
 struct fb_info {

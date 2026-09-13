@@ -54,6 +54,8 @@ static int drag_offset_x, drag_offset_y;
 
 static int wallpaper_btn_x, wallpaper_btn_y, wallpaper_btn_w, wallpaper_btn_h;
 static int search_btn_x, search_btn_y, search_btn_w, search_btn_h;
+static int network_btn_x, network_btn_y, network_btn_w, network_btn_h;
+static bool network_panel_open = false;
 
 #define SEARCH_QUERY_MAX 32
 static bool search_open = false;
@@ -261,6 +263,8 @@ void wm_init(void) {
 	memset(windows, 0, sizeof(windows));
 	window_count = 0;
 	app_count = 0;
+	network_panel_open = false;
+	netinfo_scan(); /* so the taskbar icon reflects real status immediately, not just after the first click */
 
 	base_cx = screen_w / 2 - 340;
 	base_cy = screen_h / 2 - 230;
@@ -315,6 +319,27 @@ static void draw_search_glyph(int cx, int cy, gfx_color_t color) {
 	}
 	gfx_draw_line(cx + 2, cy + 2, cx + 6, cy + 6, color);
 	gfx_draw_line(cx + 3, cy + 2, cx + 6, cy + 5, color);
+}
+
+/* Small ascending-bars network icon (like any OS's connectivity
+ * indicator), colored by real detected hardware status rather than a
+ * fake connection state: dim gray with no hardware found, accent blue
+ * if a network controller was actually enumerated over PCI. There's no
+ * "connected" state to show at all - see netinfo.c's file comment on
+ * why that would be dishonest to fake. */
+static void draw_network_glyph(int cx, int cy) {
+	struct netinfo_status status;
+	netinfo_get(&status);
+	gfx_color_t color = status.hardware_found ? COL_ACCENT : COL_TEXT_DIM;
+
+	int base_y = cy + 6;
+	int bar_w = 3, gap = 2;
+	int heights[4] = { 3, 6, 9, 12 };
+	int x = cx - 7;
+	for (int i = 0; i < 4; i++) {
+		gfx_fill_rect(x, base_y - heights[i], bar_w, heights[i], color);
+		x += bar_w + gap;
+	}
 }
 
 /* case-insensitive substring test - the shared libc only has exact
@@ -433,6 +458,16 @@ static void draw_taskbar(void) {
 		search_open ? COL_TASKBAR_ACTIVE : GFX_RGB(0x1C, 0x1F, 0x2C));
 	draw_search_glyph(search_btn_x + search_btn_w / 2, search_btn_y + search_btn_h / 2, COL_TEXT);
 
+	/* network status button - real PCI-detected hardware, honestly no
+	 * connectivity behind it (see netinfo.c) */
+	network_btn_x = search_btn_x + search_btn_w + 12;
+	network_btn_y = y + 8;
+	network_btn_w = TASKBAR_H - 16;
+	network_btn_h = TASKBAR_H - 16;
+	gfx_fill_round_rect(network_btn_x, network_btn_y, network_btn_w, network_btn_h, 8,
+		network_panel_open ? COL_TASKBAR_ACTIVE : GFX_RGB(0x1C, 0x1F, 0x2C));
+	draw_network_glyph(network_btn_x + network_btn_w / 2, network_btn_y + network_btn_h / 2);
+
 	/* Compute the right-side widgets' widths first so the window-button
 	 * row in the middle knows how much space it actually has and can
 	 * stop (rather than overflow underneath them) before running out. */
@@ -463,7 +498,7 @@ static void draw_taskbar(void) {
 	wallpaper_btn_w = wp_btn_w;
 	wallpaper_btn_h = TASKBAR_H - 16;
 
-	int bx = search_btn_x + search_btn_w + 12;
+	int bx = network_btn_x + network_btn_w + 12;
 	int bx_max = wallpaper_btn_x - 12; /* don't draw window buttons under the right-side widgets */
 	int topmost = -1;
 	for (int i = window_count - 1; i >= 0; i--) {
@@ -562,6 +597,45 @@ static void draw_search_panel(void) {
 		gfx_fill_round_rect(field_x + 8, row_y + (SEARCH_ROW_H - 4 - 14) / 2, 14, 14, 4, app->accent);
 		gfx_draw_string(field_x + 32, row_y + (SEARCH_ROW_H - 4 - gfx_char_height()) / 2, app->name, selected ? COL_TEXT : COL_TEXT_DIM);
 		row_y += SEARCH_ROW_H;
+	}
+}
+
+#define NETWORK_PANEL_W 300
+
+static void draw_network_panel(void) {
+	if (!network_panel_open) return;
+
+	struct netinfo_status status;
+	netinfo_get(&status);
+
+	/* Wrap the hardware name onto its own line if it's long, same idea
+	 * as everywhere else in this file that sizes a panel to its text -
+	 * here it's simpler: just size the panel tall enough for a fixed
+	 * number of lines, since the content is a short, known shape. */
+	int panel_h = status.hardware_found ? 172 : 128;
+	int panel_x = network_btn_x;
+	int panel_y = screen_h - TASKBAR_H - 12 - panel_h;
+
+	gfx_draw_soft_shadow(panel_x, panel_y, NETWORK_PANEL_W, panel_h, CORNER_RADIUS, 12);
+	gfx_fill_round_rect(panel_x, panel_y, NETWORK_PANEL_W, panel_h, CORNER_RADIUS, COL_WIN_BODY);
+	gfx_draw_rect(panel_x, panel_y, NETWORK_PANEL_W, panel_h, GFX_RGB(0x00, 0x00, 0x00));
+
+	int x = panel_x + 16, y = panel_y + 16;
+	int lh = gfx_char_height() + 6;
+
+	gfx_draw_string(x, y, "Network", COL_ACCENT); y += lh + 6;
+
+	if (status.hardware_found) {
+		gfx_draw_string(x, y, status.is_wireless ? "Wireless adapter detected:" : "Wired adapter detected:", COL_TEXT_DIM); y += lh;
+		gfx_draw_string(x, y, status.name, COL_TEXT); y += lh + 10;
+		gfx_draw_string(x, y, "No network stack is connected to it -", COL_TEXT_DIM); y += lh;
+		gfx_draw_string(x, y, "auroraOS can see the hardware but has", COL_TEXT_DIM); y += lh;
+		gfx_draw_string(x, y, "no driver/TCP-IP stack behind it yet.", COL_TEXT_DIM);
+	} else {
+		gfx_draw_string(x, y, "No network controller found.", COL_TEXT); y += lh + 10;
+		gfx_draw_string(x, y, "auroraOS checks real PCI hardware -", COL_TEXT_DIM); y += lh;
+		gfx_draw_string(x, y, "this machine/VM has none attached,", COL_TEXT_DIM); y += lh;
+		gfx_draw_string(x, y, "or it's a kind not yet recognized.", COL_TEXT_DIM);
 	}
 }
 
@@ -708,6 +782,15 @@ static void handle_click(int x, int y) {
 		close_search();
 	}
 
+	if (point_in(x, y, network_btn_x, network_btn_y, network_btn_w, network_btn_h)) {
+		network_panel_open = !network_panel_open;
+		if (network_panel_open) netinfo_scan(); /* refresh on open - cheap, and hardware could differ each boot */
+		return;
+	}
+	if (network_panel_open) {
+		network_panel_open = false; /* clicked elsewhere: close it, same as search */
+	}
+
 	if (point_in(x, y, wallpaper_btn_x, wallpaper_btn_y, wallpaper_btn_w, wallpaper_btn_h)) {
 		cycle_wallpaper();
 		return;
@@ -823,6 +906,7 @@ void wm_run(void) {
 		}
 		draw_taskbar();
 		draw_search_panel();
+		draw_network_panel();
 		draw_cursor(mx, my);
 		gfx_flip();
 

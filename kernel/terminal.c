@@ -578,6 +578,7 @@ bool terminal_dispatch(const char *cmd, char *rest) {
 	else if (strcmp(cmd, "compile") == 0) { cmd_compile(rest); }
 	else if (strcmp(cmd, "run") == 0) { cmd_run(rest); }
 	else if (strcmp(cmd, "echo") == 0) { cmd_echo_maybe_redirect(rest); }
+	else if (strcmp(cmd, "update") == 0) { updatecmd_run(); }
 	else return false;
 	return true;
 }
