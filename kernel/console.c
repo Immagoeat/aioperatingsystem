@@ -125,6 +125,19 @@ void console_putchar(char c) {
 	}
 }
 
+void console_set_cursor(int x, int y) {
+	/* Lets a full-screen editor (nano) place the console's own blinking
+	 * cursor wherever its logical cursor actually is, instead of wherever
+	 * console_putchar last left it - needed now that nano supports
+	 * arbitrary cursor movement instead of always writing at end-of-text. */
+	if (x < 0) x = 0;
+	if (y < 0) y = 0;
+	if (x >= con_cols) x = con_cols - 1;
+	if (y >= con_rows) y = con_rows - 1;
+	con_x = x;
+	con_y = y;
+}
+
 void console_write(const char *s, size_t len) {
 	for (size_t i = 0; i < len; i++) console_putchar(s[i]);
 }

@@ -29,7 +29,11 @@ static void read_line(char *buf, size_t max_len) {
 				len--;
 				console_putchar('\b');
 			}
-		} else if (len < max_len - 1) {
+		} else if (c >= 32 && c < 127 && len < max_len - 1) {
+			/* printable characters only - excludes arrow keys and other
+			 * Ctrl+key combos, which this simple line editor has no
+			 * behavior for (no history, no cursor movement) and
+			 * shouldn't insert as garbage bytes into the command line */
 			buf[len++] = c;
 			console_putchar(c);
 		}

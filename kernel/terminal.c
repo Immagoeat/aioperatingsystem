@@ -189,13 +189,13 @@ static void cmd_echo_maybe_redirect(char *rest) {
 
 /* --- nano: a small full-screen text editor ---
  *
- * Deliberately simple, matching what the keyboard driver actually
- * supports (no arrow keys - see keyboard.c): text entry is append/
- * backspace-only within the current line, Enter starts a new line,
+ * Deliberately simple, but supports real cursor movement: arrow keys
+ * reposition within and across lines, Enter splits the current line at
+ * the cursor, Backspace deletes the character before the cursor
+ * (merging with the previous line at column 0), and typed characters
+ * insert at the cursor rather than only appending at end-of-line.
  * Ctrl+S saves, Ctrl+X exits (prompting to save first if there are
- * unsaved changes). No cursor repositioning back into earlier lines -
- * a real constraint worth stating plainly rather than pretending this
- * is full nano. Good enough to write and revise a short assembly
+ * unsaved changes). Good enough to write and revise a short assembly
  * program, which is its main purpose here. */
 #define NANO_MAX_LINES 200
 #define NANO_MAX_LINE_LEN 100
@@ -251,20 +251,32 @@ static bool nano_save(struct nano_buffer *nb, const char *filename) {
 	return ok;
 }
 
+#define NANO_HEADER_ROWS 2 /* title line + blank line, before the text area starts */
+
 static void nano_redraw(struct nano_buffer *nb, const char *filename) {
 	console_clear();
 	console_set_color(console_color_accent());
-	kprintf("-- nano: %s%s -- (Ctrl+S save, Ctrl+X exit)\n\n", filename, nb->dirty ? " [modified]" : "");
+	kprintf("-- nano: %s%s -- (arrows move, Ctrl+S save, Ctrl+X exit)\n\n", filename, nb->dirty ? " [modified]" : "");
 	console_set_color(console_color_default());
 
 	int visible_start = 0;
 	int max_visible = 30; /* keep well within the console's row count */
-	if (nb->line_count > max_visible) visible_start = nb->line_count - max_visible;
+	/* Scroll so the cursor's line is always in view, not just the tail
+	 * of the file - needed now that the cursor can sit anywhere, not
+	 * just at the end of the text. */
+	if (nb->cur_line >= visible_start + max_visible) visible_start = nb->cur_line - max_visible + 1;
+	if (nb->cur_line < visible_start) visible_start = nb->cur_line;
+	if (nb->line_count > max_visible && visible_start > nb->line_count - max_visible) {
+		visible_start = nb->line_count - max_visible;
+	}
+	if (visible_start < 0) visible_start = 0;
 
 	for (int i = visible_start; i < nb->line_count; i++) {
 		console_writestring(nb->lines[i]);
 		console_putchar('\n');
 	}
+
+	console_set_cursor(nb->cur_col, NANO_HEADER_ROWS + (nb->cur_line - visible_start));
 }
 
 static void cmd_nano(const char *filename) {
@@ -303,7 +315,16 @@ static void cmd_nano(const char *filename) {
 			nano_redraw(&nb, filename);
 			console_present();
 		} else if (c == '\n') {
+			/* Split the current line at the cursor: everything before
+			 * cur_col stays on this line, everything from cur_col on
+			 * moves to a new line right after it. */
 			if (nb.line_count < NANO_MAX_LINES) {
+				char *cur = nb.lines[nb.cur_line];
+				for (int i = nb.line_count; i > nb.cur_line + 1; i--) {
+					strcpy(nb.lines[i], nb.lines[i - 1]);
+				}
+				strcpy(nb.lines[nb.cur_line + 1], cur + nb.cur_col);
+				cur[nb.cur_col] = '\0';
 				nb.line_count++;
 				nb.cur_line++;
 				nb.cur_col = 0;
@@ -313,8 +334,14 @@ static void cmd_nano(const char *filename) {
 			}
 		} else if (c == '\b') {
 			if (nb.cur_col > 0) {
+				/* delete the character immediately before the cursor,
+				 * shifting the remainder of the line left */
+				char *line = nb.lines[nb.cur_line];
+				int len = (int)strlen(line);
+				for (int i = nb.cur_col - 1; i < len; i++) {
+					line[i] = line[i + 1];
+				}
 				nb.cur_col--;
-				nb.lines[nb.cur_line][nb.cur_col] = '\0';
 				nb.dirty = true;
 				nano_redraw(&nb, filename);
 				console_present();
@@ -336,12 +363,54 @@ static void cmd_nano(const char *filename) {
 					console_present();
 				}
 			}
+		} else if (c == KEY_ARROW_LEFT) {
+			if (nb.cur_col > 0) {
+				nb.cur_col--;
+			} else if (nb.cur_line > 0) {
+				nb.cur_line--;
+				nb.cur_col = (int)strlen(nb.lines[nb.cur_line]);
+			}
+			nano_redraw(&nb, filename);
+			console_present();
+		} else if (c == KEY_ARROW_RIGHT) {
+			int len = (int)strlen(nb.lines[nb.cur_line]);
+			if (nb.cur_col < len) {
+				nb.cur_col++;
+			} else if (nb.cur_line < nb.line_count - 1) {
+				nb.cur_line++;
+				nb.cur_col = 0;
+			}
+			nano_redraw(&nb, filename);
+			console_present();
+		} else if (c == KEY_ARROW_UP) {
+			if (nb.cur_line > 0) {
+				nb.cur_line--;
+				int len = (int)strlen(nb.lines[nb.cur_line]);
+				if (nb.cur_col > len) nb.cur_col = len;
+			}
+			nano_redraw(&nb, filename);
+			console_present();
+		} else if (c == KEY_ARROW_DOWN) {
+			if (nb.cur_line < nb.line_count - 1) {
+				nb.cur_line++;
+				int len = (int)strlen(nb.lines[nb.cur_line]);
+				if (nb.cur_col > len) nb.cur_col = len;
+			}
+			nano_redraw(&nb, filename);
+			console_present();
 		} else if (c >= 32 && c < 127) {
-			if (nb.cur_col < NANO_MAX_LINE_LEN - 1) {
-				nb.lines[nb.cur_line][nb.cur_col++] = c;
-				nb.lines[nb.cur_line][nb.cur_col] = '\0';
+			char *line = nb.lines[nb.cur_line];
+			int len = (int)strlen(line);
+			if (len < NANO_MAX_LINE_LEN - 1) {
+				/* insert at the cursor, shifting the rest of the line
+				 * right (rather than only ever appending at the end) */
+				for (int i = len; i >= nb.cur_col; i--) {
+					line[i + 1] = line[i];
+				}
+				line[nb.cur_col] = c;
+				nb.cur_col++;
 				nb.dirty = true;
-				console_putchar(c);
+				nano_redraw(&nb, filename);
 				console_present();
 			}
 		}

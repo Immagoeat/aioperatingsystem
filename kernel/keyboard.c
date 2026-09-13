@@ -26,6 +26,8 @@ static const char scancode_ascii_shift[128] = {
 	'*', 0, ' ', 0,
 };
 
+static bool extended_prefix = false; /* saw 0xE0 - the next byte is an "extended" key (arrows, etc.) */
+
 static void kbd_buffer_push(char c) {
 	int next = (kbd_head + 1) % KBD_BUFFER_SIZE;
 	if (next != kbd_tail) {
@@ -37,6 +39,27 @@ static void kbd_buffer_push(char c) {
 static void keyboard_callback(struct registers *regs) {
 	(void)regs;
 	uint8_t scancode = inb(0x60);
+
+	if (scancode == 0xE0) { extended_prefix = true; return; }
+
+	if (extended_prefix) {
+		extended_prefix = false;
+		/* Arrow keys (scancode set 1, "extended" 0xE0-prefixed codes).
+		 * Pushed as values above the ASCII/Ctrl-code range (see
+		 * KEY_ARROW_* in kernel.h) so callers can tell them apart from
+		 * any real character without a separate "is this an arrow key"
+		 * API - keyboard_getchar_blocking() still just returns a char. */
+		if (!(scancode & 0x80)) { /* ignore the key-release half */
+			switch (scancode) {
+				case 0x48: kbd_buffer_push(KEY_ARROW_UP); break;
+				case 0x50: kbd_buffer_push(KEY_ARROW_DOWN); break;
+				case 0x4B: kbd_buffer_push(KEY_ARROW_LEFT); break;
+				case 0x4D: kbd_buffer_push(KEY_ARROW_RIGHT); break;
+				default: break; /* other extended keys: not handled */
+			}
+		}
+		return;
+	}
 
 	if (scancode == 0x2A || scancode == 0x36) { shift_pressed = true; return; }
 	if (scancode == 0xAA || scancode == 0xB6) { shift_pressed = false; return; }

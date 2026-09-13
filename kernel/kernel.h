@@ -65,6 +65,7 @@ void console_putchar(char c);
 void console_write(const char *s, size_t len);
 void console_writestring(const char *s);
 void console_present(void);
+void console_set_cursor(int x, int y);
 
 /* --- string.c --- */
 size_t strlen(const char *str);
@@ -147,6 +148,19 @@ bool keyboard_has_key(void);
  * terminals have always used: Ctrl+A=1 .. Ctrl+Z=26), so a GUI shortcut
  * bound to Ctrl+Q checks for CTRL_KEY('q') rather than the plain letter. */
 #define CTRL_KEY(c) ((c) - 'a' + 1)
+
+/* Arrow keys are pushed into the same char-based keyboard buffer as
+ * everything else, using values above the ASCII/Ctrl-code range (which
+ * only ever produces 0, 1-26, or 32-126) so callers can tell them apart
+ * from any real character with a plain equality check - no separate
+ * "is this an arrow key" API needed. `char` is signed on this platform,
+ * so these are written as explicit negative values instead of raw
+ * bytes >= 128, which would be surprising/UB-adjacent to write as a
+ * plain int-to-char narrowing conversion. */
+#define KEY_ARROW_UP    ((char)-1)
+#define KEY_ARROW_DOWN  ((char)-2)
+#define KEY_ARROW_LEFT  ((char)-3)
+#define KEY_ARROW_RIGHT ((char)-4)
 
 /* --- shell.c --- */
 void shell_run(void);
