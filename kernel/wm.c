@@ -264,14 +264,11 @@ void wm_init(void) {
 	register_app("About auroraOS", 0, 0, 500, 320, paint_about, COL_ACCENT);
 	register_app("Uptime", 540, 0, 280, 190, paint_counter, GFX_RGB(0x28, 0xC8, 0x40));
 	register_app("Palette", 100, 290, 320, 160, paint_palette, GFX_RGB(0xB1, 0x8C, 0xFF));
-
-	/* auto-launched like the apps above so they show up on the desktop
-	 * at startup; Text Editor is registered afterwards instead, since a
-	 * console app takes over the whole screen and shouldn't fire the
-	 * moment the desktop boots - only when the user opens it. */
-	for (int i = 0; i < app_count; i++) launch_or_focus_app(i);
-
 	register_console_app("Text Editor");
+
+	/* Apps are registered so search/the taskbar can find them, but none
+	 * are opened automatically - the desktop boots to an empty screen,
+	 * same as a real OS, and the user opens what they want via search. */
 }
 
 static void draw_titlebar_button(int x, int y, gfx_color_t color) {
@@ -838,6 +835,12 @@ void wm_run(void) {
 						search_query[--search_query_len] = '\0';
 						search_selected = 0;
 					}
+				} else if (c == KEY_ARROW_DOWN) {
+					int matches[MAX_APPS];
+					int match_count = search_matches(matches);
+					if (search_selected < match_count - 1) search_selected++;
+				} else if (c == KEY_ARROW_UP) {
+					if (search_selected > 0) search_selected--;
 				} else if (c >= 32 && c < 127 && search_query_len < SEARCH_QUERY_MAX - 1) {
 					search_query[search_query_len++] = c;
 					search_query[search_query_len] = '\0';
