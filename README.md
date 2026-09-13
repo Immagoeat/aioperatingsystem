@@ -37,9 +37,9 @@ modern windowed desktop GUI a `gui` command away.
   macOS-style traffic-light window controls, swappable desktop wallpapers,
   a taskbar with a live wall-clock, a keyboard-navigable app-launcher search
   bar, a few demo apps (About, an animated uptime counter, a color palette
-  viewer), plus a real Text Editor (nano) and Terminal (the same shell as
-  the text-mode prompt) that both run full-screen over the desktop
-  — see [kernel/wm.c](kernel/wm.c)
+  viewer), plus a real Text Editor (nano), Terminal (the same shell as the
+  text-mode prompt), and a Settings app (timezone, so far) that all run
+  full-screen over the desktop — see [kernel/wm.c](kernel/wm.c)
 - Swappable wallpapers baked in at build time from
   [assets/wallpapers/](assets/wallpapers/) — see [kernel/wallpaper.c](kernel/wallpaper.c)
 - A detailed, smooth-edged mouse cursor: a tapered arrow silhouette at
@@ -135,14 +135,14 @@ anything. Apps are registered once in `wm_init()`'s `register_app()` /
 `register_console_app()` calls in [kernel/wm.c](kernel/wm.c); adding a new
 one there automatically makes it searchable too.
 
-### Text Editor and Terminal
+### Text Editor, Terminal, and Settings
 
-Two of the searchable apps aren't drawn as windows: **Text Editor** and
-**Terminal** are "console apps" that take over the whole screen using the
-same software console the text-mode shell uses, rather than being painted
-into a window on the desktop. Launching one suspends the desktop (the same
-switch `Ctrl+Q` does), runs full-screen, and restores the desktop exactly
-as it was on exit.
+Three of the searchable apps aren't drawn as windows: **Text Editor**,
+**Terminal**, and **Settings** are "console apps" that take over the whole
+screen using the same software console the text-mode shell uses, rather
+than being painted into a window on the desktop. Launching one suspends
+the desktop (the same switch `Ctrl+Q` does), runs full-screen, and
+restores the desktop exactly as it was on exit.
 
 - **Text Editor** prompts for a filename (created if it doesn't exist,
   relative to the filesystem root) and opens it in the same `nano`-style
@@ -151,11 +151,26 @@ as it was on exit.
   identical commands, same real FAT16 filesystem — except `exit` takes
   its place of `gui` (you're already inside the desktop; `exit` returns to
   it instead of recursing into another copy of it).
+- **Settings** currently holds one setting: timezone (see below).
 
-See `run_console_app()` / `is_console_app` in [kernel/wm.c](kernel/wm.c)
-and `terminal_launch_nano_from_gui()` / `terminal_app_run()` in
+See `run_console_app()` / `is_console_app` in [kernel/wm.c](kernel/wm.c),
+`terminal_launch_nano_from_gui()` / `terminal_app_run()` in
 [kernel/terminal.c](kernel/terminal.c) and
-[kernel/shell.c](kernel/shell.c).
+[kernel/shell.c](kernel/shell.c), and `settings_app_run()` in
+[kernel/settings.c](kernel/settings.c).
+
+### Timezone
+
+There's no way for a freestanding kernel on real x86 hardware to actually
+detect the user's geographic region — no network stack, no GPS, and the
+CMOS RTC itself has no timezone field, just a wall-clock. So "auto-detect"
+here is deliberately honest about what's actually possible: the RTC is
+assumed to already show local time (the default, a 0-minute offset — i.e.
+trust the RTC as-is), and the **Settings** app lets you pick your real UTC
+offset from a list of named zones (arrows move, Enter selects, Escape
+cancels) if the clock looks wrong. The offset is applied once, centrally,
+inside `rtc_get_time()` in [kernel/rtc.c](kernel/rtc.c), so the taskbar
+clock (and anything else that reads the time) reflects it automatically.
 
 ## Filesystem, terminal, and custom programs
 

@@ -237,6 +237,8 @@ static void launch_or_focus_app(int app_index) {
 			run_console_app(terminal_launch_nano_from_gui);
 		} else if (strcmp(app->name, "Terminal") == 0) {
 			run_console_app(terminal_app_run);
+		} else if (strcmp(app->name, "Settings") == 0) {
+			run_console_app(settings_app_run);
 		}
 		return;
 	}
@@ -268,6 +270,7 @@ void wm_init(void) {
 	register_app("Palette", 100, 290, 320, 160, paint_palette, GFX_RGB(0xB1, 0x8C, 0xFF));
 	register_console_app("Text Editor");
 	register_console_app("Terminal");
+	register_console_app("Settings");
 
 	/* Apps are registered so search/the taskbar can find them, but none
 	 * are opened automatically - the desktop boots to an empty screen,

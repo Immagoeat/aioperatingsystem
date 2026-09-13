@@ -28,6 +28,27 @@ static uint8_t bcd_to_bin(uint8_t val) {
 	return (uint8_t)((val & 0x0F) + ((val >> 4) * 10));
 }
 
+/* There's no way for a freestanding kernel on real x86 hardware to
+ * actually detect the user's timezone (no network stack, no GPS, and
+ * the CMOS RTC itself has no timezone field - it's just a wall-clock).
+ * So "auto-detect" here is deliberately honest about what it can do:
+ * the RTC is assumed to already show local time (the same assumption
+ * every BIOS/CMOS clock setup screen makes), and this offset starts at
+ * 0 - i.e. "trust the RTC as-is" - until the user picks a real UTC
+ * offset in Settings, at which point it's applied on top. */
+static int timezone_offset_minutes = 0;
+
+void rtc_set_timezone_offset_minutes(int minutes) {
+	/* clamp to the real range of UTC offsets in use (UTC-12 to UTC+14) */
+	if (minutes < -12 * 60) minutes = -12 * 60;
+	if (minutes > 14 * 60) minutes = 14 * 60;
+	timezone_offset_minutes = minutes;
+}
+
+int rtc_get_timezone_offset_minutes(void) {
+	return timezone_offset_minutes;
+}
+
 void rtc_get_time(struct rtc_time *out) {
 	uint8_t seconds, minutes, hours;
 	uint8_t last_seconds, last_minutes, last_hours;
@@ -67,7 +88,14 @@ void rtc_get_time(struct rtc_time *out) {
 		if (!pm && hours == 12) hours = 0;
 	}
 
-	out->hours = hours;
-	out->minutes = minutes;
+	/* Apply the configured timezone offset, wrapping the day around
+	 * cleanly (an offset can push the displayed time to the previous or
+	 * next day's hours without that meaning anything else changed). */
+	int total_minutes = hours * 60 + minutes + timezone_offset_minutes;
+	total_minutes %= 24 * 60;
+	if (total_minutes < 0) total_minutes += 24 * 60;
+
+	out->hours = (uint8_t)(total_minutes / 60);
+	out->minutes = (uint8_t)(total_minutes % 60);
 	out->seconds = seconds;
 }

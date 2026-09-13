@@ -138,6 +138,12 @@ struct rtc_time {
 	uint8_t seconds; /* 0-59 */
 };
 void rtc_get_time(struct rtc_time *out);
+/* Timezone offset applied on top of the raw RTC reading (see rtc.c's
+ * file comment on why this - not real geolocation - is what "timezone"
+ * means on bare hardware with no network stack). Minutes, so half-hour
+ * zones like UTC+5:30 are representable; defaults to 0. */
+void rtc_set_timezone_offset_minutes(int minutes);
+int rtc_get_timezone_offset_minutes(void);
 
 /* --- keyboard.c --- */
 void keyboard_install(void);
@@ -169,6 +175,14 @@ void shell_run(void);
  * Caller is responsible for switching graphics modes before/after,
  * same as the shell (Ctrl+Q) and Text Editor already do. */
 void terminal_app_run(void);
+
+/* --- settings.c --- */
+/* Launches Settings as a GUI app (see wm.c's "Settings"): currently just
+ * a timezone picker (see settings.c's file comment on why "auto-detect"
+ * means "assume the RTC is local time" rather than real geolocation).
+ * Caller is responsible for switching graphics modes before/after, same
+ * as the shell (Ctrl+Q), Text Editor, and Terminal already do. */
+void settings_app_run(void);
 
 /* --- terminal.c: filesystem-aware commands (ls, cd, touch, rm, cat,
  * mkdir, echo with redirection, nano, compile, run). Returns false if
