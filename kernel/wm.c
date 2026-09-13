@@ -187,6 +187,12 @@ struct app_entry {
 	int x_offset, y_offset, w, h;
 	window_paint_fn paint;
 	gfx_color_t accent;
+	/* Console apps (nano) aren't drawn as a window at all - they take
+	 * over the whole screen via the software console the same way the
+	 * shell does, so launching one suspends the WM loop entirely rather
+	 * than creating a struct window. `paint`/geometry are unused (and
+	 * left zeroed) for these. */
+	bool is_console_app;
 };
 
 #define MAX_APPS 8
@@ -196,7 +202,12 @@ static int base_cx, base_cy;
 
 static void register_app(const char *name, int x_offset, int y_offset, int w, int h, window_paint_fn paint, gfx_color_t accent) {
 	if (app_count >= MAX_APPS) return;
-	apps[app_count++] = (struct app_entry){ name, x_offset, y_offset, w, h, paint, accent };
+	apps[app_count++] = (struct app_entry){ name, x_offset, y_offset, w, h, paint, accent, false };
+}
+
+static void register_console_app(const char *name) {
+	if (app_count >= MAX_APPS) return;
+	apps[app_count++] = (struct app_entry){ name, 0, 0, 0, 0, NULL, 0, true };
 }
 
 static int find_open_window_by_name(const char *name) {
@@ -206,9 +217,27 @@ static int find_open_window_by_name(const char *name) {
 	return -1;
 }
 
+static void run_console_app(void (*entry)(void)) {
+	console_clear();
+	gfx_set_font_scale(1);
+	entry();
+	gfx_set_font_scale(2);
+	/* the console app owns the keyboard buffer while it runs; nothing
+	 * queued during that time is meant for the desktop, so drop it
+	 * rather than have leftover keystrokes fire WM shortcuts on return */
+	while (keyboard_has_key()) keyboard_getchar_blocking();
+}
+
 static void launch_or_focus_app(int app_index) {
 	if (app_index < 0 || app_index >= app_count) return;
 	struct app_entry *app = &apps[app_index];
+
+	if (app->is_console_app) {
+		if (strcmp(app->name, "Text Editor") == 0) {
+			run_console_app(terminal_launch_nano_from_gui);
+		}
+		return;
+	}
 
 	int idx = find_open_window_by_name(app->name);
 	if (idx < 0) {
@@ -236,7 +265,13 @@ void wm_init(void) {
 	register_app("Uptime", 540, 0, 280, 190, paint_counter, GFX_RGB(0x28, 0xC8, 0x40));
 	register_app("Palette", 100, 290, 320, 160, paint_palette, GFX_RGB(0xB1, 0x8C, 0xFF));
 
+	/* auto-launched like the apps above so they show up on the desktop
+	 * at startup; Text Editor is registered afterwards instead, since a
+	 * console app takes over the whole screen and shouldn't fire the
+	 * moment the desktop boots - only when the user opens it. */
 	for (int i = 0; i < app_count; i++) launch_or_focus_app(i);
+
+	register_console_app("Text Editor");
 }
 
 static void draw_titlebar_button(int x, int y, gfx_color_t color) {

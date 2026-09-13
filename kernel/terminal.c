@@ -444,6 +444,57 @@ static void cmd_nano(const char *filename) {
 	console_writestring("Exited nano.\n");
 }
 
+/* Reads a filename from the console the same simple way shell.c's own
+ * read_line() does (printable characters only - arrow keys and Ctrl
+ * codes are excluded rather than inserted as garbage). Used by the GUI
+ * "Text Editor" app, which has no text-input dialog of its own, so it
+ * borrows the console for just this one prompt before nano takes over. */
+static void read_filename(char *buf, size_t max_len) {
+	size_t len = 0;
+	for (;;) {
+		char c = keyboard_getchar_blocking();
+		if (c == '\n') {
+			buf[len] = '\0';
+			console_putchar('\n');
+			console_present();
+			return;
+		} else if (c == '\b') {
+			if (len > 0) { len--; console_putchar('\b'); }
+		} else if (c >= 32 && c < 127 && len < max_len - 1) {
+			buf[len++] = c;
+			console_putchar(c);
+		}
+		console_present();
+	}
+}
+
+/* Entry point for launching nano as a GUI app (see wm.c's "Text Editor"
+ * app entry): drops to the console to ask which file to open/create at
+ * the filesystem root, then runs the normal nano editor. wm.c is
+ * responsible for switching graphics modes before/after calling this,
+ * the same way it already does around the shell (Ctrl+Q). */
+void terminal_launch_nano_from_gui(void) {
+	console_clear();
+	if (!fs_ready()) {
+		console_writestring("\nPress any key to return to the desktop...\n");
+		console_present();
+		keyboard_getchar_blocking();
+		return;
+	}
+
+	console_set_color(console_color_accent());
+	console_writestring("auroraOS Text Editor\n");
+	console_set_color(console_color_default());
+	console_writestring("File to open (created if it doesn't exist): ");
+	console_present();
+
+	char filename[MAX_PATH_NAME];
+	read_filename(filename, sizeof(filename));
+	if (filename[0] == '\0') return;
+
+	cmd_nano(filename);
+}
+
 /* --- compile / run --- */
 
 static void cmd_compile(const char *filename) {

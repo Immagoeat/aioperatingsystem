@@ -171,6 +171,11 @@ void shell_run(void);
  * to its own commands / the "unknown command" message. */
 bool terminal_dispatch(const char *cmd, char *rest);
 void terminal_print_cwd_prompt_suffix(void);
+/* Launches nano as a full-screen console app from the GUI (see wm.c's
+ * "Text Editor" app): prompts for a filename, then edits it. Caller is
+ * responsible for switching graphics modes before/after, same as the
+ * shell (Ctrl+Q) already does. */
+void terminal_launch_nano_from_gui(void);
 
 /* --- memory.c --- */
 struct fb_info {
