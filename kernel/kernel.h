@@ -29,13 +29,41 @@ struct pci_network_device {
 };
 typedef void (*pci_device_callback)(const struct pci_network_device *dev, void *userdata);
 void pci_find_network_controllers(pci_device_callback cb, void *userdata);
+uint32_t pci_read_bar(uint8_t bus, uint8_t device, uint8_t function, int bar_index);
+void pci_enable_bus_mastering(uint8_t bus, uint8_t device, uint8_t function);
+
+/* --- e1000.c: driver for the Intel 8254x Ethernet controller (the NIC
+ * QEMU emulates by default) - polling send/receive, no interrupts.
+ * See e1000.c's file comment for scope/rationale. --- */
+bool e1000_init(void);
+bool e1000_is_present(void);
+void e1000_get_mac(uint8_t out[6]);
+bool e1000_send(const void *data, uint16_t len);
+uint16_t e1000_poll_receive(void *out, uint16_t max_len); /* returns 0 if nothing received */
+
+/* --- net.c: just enough of a stack (Ethernet/ARP/IPv4/UDP/DHCP) to get
+ * a real DHCP lease over the e1000 driver above - see net.c's file
+ * comment for scope. --- */
+struct net_status {
+	bool have_lease;
+	uint8_t mac[6];
+	char ip_str[16];
+	char subnet_str[16];
+	char gateway_str[16];
+	char message[64]; /* human-readable outcome, success or failure */
+};
+bool net_init_and_request_lease(void); /* brings up the NIC and runs a full DHCP exchange; can block up to ~6 seconds (two DHCP_TIMEOUT_TICKS waits) */
+bool net_get_status(struct net_status *out); /* returns the same as its bool return: whether a lease is currently held */
 
 /* --- netinfo.c: honest network hardware status for the GUI's network
- * panel. No stack, no driver, no Wi-Fi - just "is a network controller
- * actually present, and what is it" (see netinfo.c's file comment). --- */
+ * panel: what's actually attached (via pci.c), and whether there's a
+ * real driver behind it (only the e1000, via e1000.c/net.c - still no
+ * Wi-Fi, and no fake "Connected" state for anything else). See
+ * netinfo.c's file comment. --- */
 struct netinfo_status {
 	bool hardware_found;
 	bool is_wireless;
+	bool driver_supported; /* true only for hardware net.c/e1000.c can actually drive */
 	char name[48];
 };
 void netinfo_scan(void); /* re-enumerates PCI; call once at GUI startup, or on demand from the panel */

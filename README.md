@@ -78,11 +78,15 @@ modern windowed desktop GUI a `gui` command away.
 - An interactive shell with builtin commands:
   `help`, `about`, `clear`, `mem`, `uptime`, `gui`, `reboot`, `halt`, plus
   every terminal.c command above
-- Real PCI configuration-space enumeration ([kernel/pci.c](kernel/pci.c)) and
-  an honest network-status panel in the taskbar ([kernel/netinfo.c](kernel/netinfo.c)):
-  it detects whatever real network controller is actually attached (no
-  network stack, no Wi-Fi driver, no fake "Connected" state — see the
-  Network section below)
+- Real PCI configuration-space enumeration ([kernel/pci.c](kernel/pci.c)),
+  a real driver for the Intel e1000 Ethernet controller
+  ([kernel/e1000.c](kernel/e1000.c): MMIO registers, DMA descriptor rings,
+  polling TX/RX), and just enough of a network stack
+  ([kernel/net.c](kernel/net.c): Ethernet/ARP/IPv4/UDP/DHCP) to request and
+  receive a real DHCP lease — `netconnect` in the shell or "Connect" in the
+  taskbar's network panel. No Wi-Fi (needs per-chipset firmware-dependent
+  drivers and a WPA supplicant — thousands more lines of work), no fake
+  "Connected" state for unsupported hardware — see the Network section below
 - A real (not simulated) update mechanism given the constraint that there's
   no network stack to fetch updates over: an `update` command
   ([kernel/updatecmd.c](kernel/updatecmd.c)) validates and installs a staged
@@ -194,16 +198,38 @@ clock (and anything else that reads the time) reflects it automatically.
 
 Real Wi-Fi (scanning networks, WPA handshakes, per-chipset firmware-
 dependent drivers) is thousands of lines of work and not something
-auroraOS fakes. What it does instead is real: [kernel/pci.c](kernel/pci.c)
-enumerates PCI configuration space (the standard 0xCF8/0xCFC mechanism) and
-looks for any class-0x02 (network) controller, cross-referencing a small
-table of chipsets it can name (QEMU's emulated e1000/rtl8139/virtio-net,
-plus a couple of common real wired NICs). [kernel/netinfo.c](kernel/netinfo.c)
-turns that into a simple status the network icon in the taskbar reflects -
-click it to see what was actually found. There's no network stack behind
-any of it (no driver, no TCP/IP), and the panel says so plainly rather than
-showing a fake "Connected" state; if a device isn't in the known-chipset
-table it still shows up, just labeled by its raw vendor:device ID.
+auroraOS fakes. What auroraOS has instead is real wired networking:
+
+- [kernel/pci.c](kernel/pci.c) enumerates PCI configuration space (the
+  standard 0xCF8/0xCFC mechanism), reads BARs, and can enable a device's
+  bus-mastering (needed for DMA) - looking for any class-0x02 (network)
+  controller and cross-referencing a small table of chipsets it can name
+  (QEMU's emulated e1000/rtl8139/virtio-net, plus a couple of common real
+  wired NICs).
+- [kernel/e1000.c](kernel/e1000.c) is a real driver for the Intel 8254x
+  family (the NIC QEMU emulates by default) - MMIO register access,
+  EEPROM-read MAC address, DMA descriptor rings for TX/RX, polling
+  send/receive. Only this one chipset is supported; anything else shows up
+  in detection but has no driver behind it.
+- [kernel/net.c](kernel/net.c) layers just enough of a stack on top -
+  Ethernet framing, ARP, IPv4, UDP, and a DHCP client - to request and
+  receive a real IP lease. `netconnect` in the shell (or the "Connect"
+  button in the taskbar's network panel, wired through
+  [kernel/netinfo.c](kernel/netinfo.c)) runs the actual DHCP exchange and
+  reports the real result: a genuine leased IP/subnet/gateway/MAC on
+  success (verified end-to-end against QEMU's own SLIRP DHCP server - a
+  real `10.0.2.x` lease, not a fabricated one), or the real reason it
+  failed (no supported hardware, send failure, timeout) - never a fake
+  "Connected" state.
+
+One real bug worth noting since it's the kind of thing this stack is easy
+to get wrong silently: the TX/RX descriptor rings must be declared
+`volatile`, since hardware writes their status fields via DMA outside the
+compiler's view of program order. Without it, GCC at `-O2` legally hoists
+the status read in `e1000_send()`'s completion-polling loop out of the
+loop entirely, spinning on a stale cached value forever - every send
+appeared to hang/fail until this was fixed, confirmed by reproducing the
+failure with `volatile` removed and fixing it by restoring it.
 
 ### Updates
 
@@ -339,6 +365,9 @@ mode call on the kernel's behalf. `make run` passes `-vga std` (QEMU's
 standard/non-Cirrus VGA+VBE emulation), which is what this was developed
 and tested against — Cirrus's emulation is more forgiving of imprecise VGA
 register programming in ways that can mask bugs real hardware won't.
+It also explicitly attaches an emulated Intel e1000 NIC on QEMU's
+user-mode (SLIRP) network backend, so `netconnect`/the network panel have
+real hardware to find and a real DHCP server to lease from.
 
 Once booted, you'll land in the `aurora:~$` shell prompt (or straight into
 the GUI after the 3-second autoboot countdown). Type `help` to see

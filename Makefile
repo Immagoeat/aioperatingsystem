@@ -91,8 +91,14 @@ disk:
 # BIOS/QEMU version combinations prefer booting from the hard disk once
 # one is attached, which would try (and fail) to boot the blank/FAT16
 # data disk instead of auroraOS itself.
+# -netdev user,... + -device e1000,... explicitly attach QEMU's
+# user-mode (SLIRP) network backend to an emulated Intel e1000 NIC -
+# the exact chipset kernel/e1000.c drives - rather than relying on
+# whatever QEMU's version-dependent implicit default happens to be, so
+# `netconnect`/the taskbar's network panel have real hardware to find.
 run: iso disk
-	qemu-system-x86_64 -cdrom $(ISO) -vga std -drive file=$(DISK_IMG),format=raw,if=ide,index=1 -boot d
+	qemu-system-x86_64 -cdrom $(ISO) -vga std -drive file=$(DISK_IMG),format=raw,if=ide,index=1 -boot d \
+		-netdev user,id=n0 -device e1000,netdev=n0
 
 clean:
 	rm -f kernel/*.o

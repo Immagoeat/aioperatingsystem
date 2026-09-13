@@ -1,17 +1,20 @@
 /* netinfo.c - honest network hardware status for the GUI's network
  * panel (see wm.c).
  *
- * There is no network stack in auroraOS: no Ethernet driver, no
- * TCP/IP, and certainly no Wi-Fi (real Wi-Fi needs a driver per
- * chipset family plus firmware blobs plus a WPA supplicant - thousands
- * of lines of work, not something to fake). What this module actually
- * does is real: enumerate PCI devices (see pci.c) and report whichever
- * network-class controller, if any, is really attached to this
- * machine/VM. The UI is built to say exactly that - detected hardware,
- * no driver, not connected - rather than a fake "Connected" toggle. */
+ * auroraOS has a real driver for exactly one chipset - the Intel e1000
+ * (see e1000.c), plus just enough of a stack (net.c) to get a DHCP
+ * lease over it. There is still no Wi-Fi (real Wi-Fi needs a driver
+ * per chipset family plus firmware blobs plus a WPA supplicant -
+ * thousands of lines of work, not something to fake). What this module
+ * does: enumerate PCI devices (see pci.c), report whichever
+ * network-class controller is really attached, and say honestly
+ * whether it's one auroraOS can actually drive - never a fake
+ * "Connected" state for hardware with no real driver behind it. */
 #include "kernel.h"
 
 #define NETINFO_NAME_MAX 48
+#define E1000_VENDOR_ID 0x8086
+#define E1000_DEVICE_ID 0x100E
 
 static void local_strncpy_bounded(char *dst, const char *src, size_t n) {
 	size_t i = 0;
@@ -22,6 +25,7 @@ static void local_strncpy_bounded(char *dst, const char *src, size_t n) {
 struct netinfo_result {
 	bool found_any;
 	bool is_wireless;
+	bool driver_supported;
 	char name[NETINFO_NAME_MAX];
 	uint16_t vendor_id, device_id;
 };
@@ -34,6 +38,7 @@ static void netinfo_collect(const struct pci_network_device *dev, void *userdata
 
 	result->found_any = true;
 	result->is_wireless = dev->is_wireless_class;
+	result->driver_supported = (dev->vendor_id == E1000_VENDOR_ID && dev->device_id == E1000_DEVICE_ID);
 	result->vendor_id = dev->vendor_id;
 	result->device_id = dev->device_id;
 
@@ -65,6 +70,7 @@ void netinfo_scan(void) {
 bool netinfo_get(struct netinfo_status *out) {
 	out->hardware_found = scan_result.found_any;
 	out->is_wireless = scan_result.is_wireless;
+	out->driver_supported = scan_result.driver_supported;
 	local_strncpy_bounded(out->name, scan_result.found_any ? scan_result.name : "", NETINFO_NAME_MAX);
 	return scan_result.found_any;
 }

@@ -56,6 +56,9 @@ static int wallpaper_btn_x, wallpaper_btn_y, wallpaper_btn_w, wallpaper_btn_h;
 static int search_btn_x, search_btn_y, search_btn_w, search_btn_h;
 static int network_btn_x, network_btn_y, network_btn_w, network_btn_h;
 static bool network_panel_open = false;
+static int connect_btn_x, connect_btn_y, connect_btn_w, connect_btn_h;
+static bool connect_attempted = false; /* true once a lease attempt has been made this session, success or failure */
+static bool connecting_in_progress = false;
 
 #define SEARCH_QUERY_MAX 32
 static bool search_open = false;
@@ -602,17 +605,43 @@ static void draw_search_panel(void) {
 
 #define NETWORK_PANEL_W 300
 
+static const char *format_mac(const uint8_t mac[6]) {
+	static char buf[18]; /* "xx:xx:xx:xx:xx:xx\0" */
+	const char *hex = "0123456789abcdef";
+	int pos = 0;
+	for (int i = 0; i < 6; i++) {
+		buf[pos++] = hex[mac[i] >> 4];
+		buf[pos++] = hex[mac[i] & 0xF];
+		if (i < 5) buf[pos++] = ':';
+	}
+	buf[pos] = '\0';
+	return buf;
+}
+
+/* Panel has three real states, not a fake "Connected" toggle:
+ *   1. no network controller detected at all
+ *   2. one detected, but it's a chipset auroraOS has no driver for
+ *      (anything other than the e1000 - see e1000.c's file comment on
+ *      why only that one chipset is supported)
+ *   3. an e1000 - shows a real "Connect" button that runs an actual
+ *      DHCP exchange (see net.c) and displays the real lease it gets
+ *      back, or the real reason it failed */
 static void draw_network_panel(void) {
 	if (!network_panel_open) return;
 
 	struct netinfo_status status;
 	netinfo_get(&status);
 
-	/* Wrap the hardware name onto its own line if it's long, same idea
-	 * as everywhere else in this file that sizes a panel to its text -
-	 * here it's simpler: just size the panel tall enough for a fixed
-	 * number of lines, since the content is a short, known shape. */
-	int panel_h = status.hardware_found ? 172 : 128;
+	struct net_status net;
+	bool have_lease = net_get_status(&net);
+
+	int panel_h;
+	if (!status.hardware_found) panel_h = 128;
+	else if (!status.driver_supported) panel_h = 154;
+	else if (have_lease) panel_h = 222;
+	else if (connect_attempted) panel_h = 188;
+	else panel_h = 158;
+
 	int panel_x = network_btn_x;
 	int panel_y = screen_h - TASKBAR_H - 12 - panel_h;
 
@@ -625,18 +654,61 @@ static void draw_network_panel(void) {
 
 	gfx_draw_string(x, y, "Network", COL_ACCENT); y += lh + 6;
 
-	if (status.hardware_found) {
-		gfx_draw_string(x, y, status.is_wireless ? "Wireless adapter detected:" : "Wired adapter detected:", COL_TEXT_DIM); y += lh;
-		gfx_draw_string(x, y, status.name, COL_TEXT); y += lh + 10;
-		gfx_draw_string(x, y, "No network stack is connected to it -", COL_TEXT_DIM); y += lh;
-		gfx_draw_string(x, y, "auroraOS can see the hardware but has", COL_TEXT_DIM); y += lh;
-		gfx_draw_string(x, y, "no driver/TCP-IP stack behind it yet.", COL_TEXT_DIM);
-	} else {
+	if (!status.hardware_found) {
 		gfx_draw_string(x, y, "No network controller found.", COL_TEXT); y += lh + 10;
 		gfx_draw_string(x, y, "auroraOS checks real PCI hardware -", COL_TEXT_DIM); y += lh;
 		gfx_draw_string(x, y, "this machine/VM has none attached,", COL_TEXT_DIM); y += lh;
 		gfx_draw_string(x, y, "or it's a kind not yet recognized.", COL_TEXT_DIM);
+		connect_btn_w = 0; /* no button in this state */
+		return;
 	}
+
+	gfx_draw_string(x, y, status.is_wireless ? "Wireless adapter detected:" : "Wired adapter detected:", COL_TEXT_DIM); y += lh;
+	gfx_draw_string(x, y, status.name, COL_TEXT); y += lh + 10;
+
+	if (!status.driver_supported) {
+		gfx_draw_string(x, y, "No driver for this chipset - only the", COL_TEXT_DIM); y += lh;
+		gfx_draw_string(x, y, "Intel e1000 is supported right now.", COL_TEXT_DIM);
+		connect_btn_w = 0;
+		return;
+	}
+
+	if (have_lease) {
+		gfx_draw_string(x, y, "Connected (DHCP lease obtained)", GFX_RGB(0x28, 0xC8, 0x40)); y += lh + 8;
+		char line[64];
+
+		strcpy(line, "IP:      "); strcat(line, net.ip_str);
+		gfx_draw_string(x, y, line, COL_TEXT); y += lh;
+
+		strcpy(line, "Subnet:  "); strcat(line, net.subnet_str);
+		gfx_draw_string(x, y, line, COL_TEXT); y += lh;
+
+		strcpy(line, "Gateway: "); strcat(line, net.gateway_str);
+		gfx_draw_string(x, y, line, COL_TEXT); y += lh;
+
+		strcpy(line, "MAC:     "); strcat(line, format_mac(net.mac));
+		gfx_draw_string(x, y, line, COL_TEXT_DIM);
+
+		connect_btn_w = 0; /* already connected - no button needed */
+		return;
+	}
+
+	if (connect_attempted) {
+		gfx_draw_string(x, y, "Connection failed:", GFX_RGB(0xFF, 0x6B, 0x6B)); y += lh;
+		gfx_draw_string(x, y, net.message, COL_TEXT_DIM); y += lh + 6;
+	}
+
+	connect_btn_x = x;
+	connect_btn_y = y;
+	connect_btn_w = NETWORK_PANEL_W - 32;
+	connect_btn_h = 32;
+	gfx_fill_round_rect(connect_btn_x, connect_btn_y, connect_btn_w, connect_btn_h, 6,
+		connecting_in_progress ? COL_TASKBAR_ACTIVE : COL_ACCENT);
+	const char *btn_label = connecting_in_progress ? "Connecting..." : "Connect (DHCP)";
+	int label_w = gfx_string_width(btn_label);
+	gfx_draw_string(connect_btn_x + (connect_btn_w - label_w) / 2,
+		connect_btn_y + (connect_btn_h - gfx_char_height()) / 2, btn_label,
+		connecting_in_progress ? COL_TEXT_DIM : COL_BLACK);
 }
 
 /* A detailed, smooth-edged cursor modeled on a real desktop OS arrow:
@@ -788,6 +860,22 @@ static void handle_click(int x, int y) {
 		return;
 	}
 	if (network_panel_open) {
+		if (connect_btn_w > 0 && !connecting_in_progress &&
+		    point_in(x, y, connect_btn_x, connect_btn_y, connect_btn_w, connect_btn_h)) {
+			/* Redraw once with the "Connecting..." state showing before
+			 * the blocking DHCP exchange runs (net_init_and_request_lease
+			 * can take up to ~6 seconds - see net.c), so the button
+			 * doesn't just silently freeze with no feedback. */
+			connecting_in_progress = true;
+			draw_taskbar();
+			draw_network_panel();
+			gfx_flip();
+
+			net_init_and_request_lease();
+			connect_attempted = true;
+			connecting_in_progress = false;
+			return;
+		}
 		network_panel_open = false; /* clicked elsewhere: close it, same as search */
 	}
 

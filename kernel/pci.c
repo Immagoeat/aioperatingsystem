@@ -49,6 +49,36 @@ static uint8_t pci_read_subclass(uint8_t bus, uint8_t device, uint8_t function) 
 	return (uint8_t)((pci_read_dword(bus, device, function, 0x08) >> 16) & 0xFF);
 }
 
+static void pci_write_dword(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset, uint32_t value) {
+	outl(PCI_CONFIG_ADDRESS, pci_config_address(bus, device, function, offset));
+	outl(PCI_CONFIG_DATA, value);
+}
+
+/* Reads BAR (Base Address Register) N (0-5) from a device's config
+ * space, returning the base address with the low status/type bits
+ * masked off. Only handles 32-bit, non-prefetchable memory BARs and
+ * I/O BARs - the e1000's BAR0 (its MMIO register window) is exactly
+ * this, so there's no need for 64-bit BAR-pair handling here. */
+uint32_t pci_read_bar(uint8_t bus, uint8_t device, uint8_t function, int bar_index) {
+	uint32_t raw = pci_read_dword(bus, device, function, (uint8_t)(0x10 + bar_index * 4));
+	if (raw & 1) {
+		return raw & 0xFFFFFFFCu; /* I/O space BAR: low 2 bits are reserved/flags */
+	}
+	return raw & 0xFFFFFFF0u; /* memory space BAR: low 4 bits are type/prefetchable flags */
+}
+
+/* Sets the Bus Master Enable and Memory Space Enable bits in the PCI
+ * command register (offset 0x04, bits 2 and 1) - required before a
+ * device can do DMA (bus mastering) or respond to its MMIO BAR at all.
+ * Without this, the e1000's descriptor rings would silently never get
+ * touched by the card. */
+void pci_enable_bus_mastering(uint8_t bus, uint8_t device, uint8_t function) {
+	uint32_t command = pci_read_dword(bus, device, function, 0x04) & 0xFFFF;
+	command |= (1u << 2) | (1u << 1); /* bus master enable, memory space enable */
+	uint32_t existing = pci_read_dword(bus, device, function, 0x04);
+	pci_write_dword(bus, device, function, 0x04, (existing & 0xFFFF0000u) | command);
+}
+
 #define PCI_CLASS_NETWORK 0x02
 
 /* A small table of vendor/device IDs worth naming by hand: the network

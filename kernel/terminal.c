@@ -187,6 +187,47 @@ static void cmd_echo_maybe_redirect(char *rest) {
 	}
 }
 
+/* --- netconnect: bring up the e1000 NIC (if present) and request a
+ * real DHCP lease. Same underlying call the GUI's network panel uses
+ * (net_init_and_request_lease() in net.c) - this just gives console-
+ * only users (no mouse, or running headless) the same real
+ * connectivity check without needing the desktop. */
+static void cmd_netconnect(void) {
+	console_writestring("Requesting a DHCP lease (this can take a few seconds)...\n");
+	console_present();
+
+	bool ok = net_init_and_request_lease();
+
+	struct net_status status;
+	net_get_status(&status);
+
+	if (ok) {
+		console_set_color(GFX_RGB(0x28, 0xC8, 0x40));
+		console_writestring("Connected.\n");
+		console_set_color(console_color_default());
+		console_writestring("  IP:      "); console_writestring(status.ip_str); console_putchar('\n');
+		console_writestring("  Subnet:  "); console_writestring(status.subnet_str); console_putchar('\n');
+		console_writestring("  Gateway: "); console_writestring(status.gateway_str); console_putchar('\n');
+
+		char mac_str[18];
+		const char *hex = "0123456789abcdef";
+		int pos = 0;
+		for (int i = 0; i < 6; i++) {
+			mac_str[pos++] = hex[status.mac[i] >> 4];
+			mac_str[pos++] = hex[status.mac[i] & 0xF];
+			if (i < 5) mac_str[pos++] = ':';
+		}
+		mac_str[pos] = '\0';
+		console_writestring("  MAC:     "); console_writestring(mac_str); console_putchar('\n');
+	} else {
+		console_set_color(GFX_RGB(0xFF, 0x6B, 0x6B));
+		console_writestring("Failed: ");
+		console_writestring(status.message);
+		console_putchar('\n');
+		console_set_color(console_color_default());
+	}
+}
+
 /* --- nano: a small full-screen text editor ---
  *
  * Deliberately simple, but supports real cursor movement: arrow keys
@@ -579,6 +620,7 @@ bool terminal_dispatch(const char *cmd, char *rest) {
 	else if (strcmp(cmd, "run") == 0) { cmd_run(rest); }
 	else if (strcmp(cmd, "echo") == 0) { cmd_echo_maybe_redirect(rest); }
 	else if (strcmp(cmd, "update") == 0) { updatecmd_run(); }
+	else if (strcmp(cmd, "netconnect") == 0) { cmd_netconnect(); }
 	else return false;
 	return true;
 }
