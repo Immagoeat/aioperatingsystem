@@ -253,10 +253,29 @@ static bool nano_save(struct nano_buffer *nb, const char *filename) {
 
 #define NANO_HEADER_ROWS 2 /* title line + blank line, before the text area starts */
 
+/* Width of the "NNN | " line-number gutter, sized to the line count so
+ * numbers stay right-aligned and the "| " separator lines up even once
+ * the file grows past 9/99/999 lines. */
+static int nano_line_number_digits(const struct nano_buffer *nb) {
+	int digits = 1;
+	for (int n = nb->line_count; n >= 10; n /= 10) digits++;
+	return digits;
+}
+
+/* kprintf has no field-width support (see printf.c), so right-align the
+ * line number by hand: pad with spaces, then print the number itself. */
+static void nano_print_line_number(int number, int digits) {
+	int n_digits = 1;
+	for (int n = number; n >= 10; n /= 10) n_digits++;
+	for (int i = n_digits; i < digits; i++) console_putchar(' ');
+	kprintf("%d | ", number);
+}
+
 static void nano_redraw(struct nano_buffer *nb, const char *filename) {
 	console_clear();
 	console_set_color(console_color_accent());
-	kprintf("-- nano: %s%s -- (arrows move, Ctrl+S save, Ctrl+X exit)\n\n", filename, nb->dirty ? " [modified]" : "");
+	kprintf("-- nano: %s%s -- Ln %d, Col %d / %d lines -- (arrows move, Ctrl+S save, Ctrl+X exit)\n\n",
+		filename, nb->dirty ? " [modified]" : "", nb->cur_line + 1, nb->cur_col + 1, nb->line_count);
 	console_set_color(console_color_default());
 
 	int visible_start = 0;
@@ -271,12 +290,17 @@ static void nano_redraw(struct nano_buffer *nb, const char *filename) {
 	}
 	if (visible_start < 0) visible_start = 0;
 
+	int digits = nano_line_number_digits(nb);
+	int gutter = digits + 3; /* digits + " | " */
 	for (int i = visible_start; i < nb->line_count; i++) {
+		console_set_color(console_color_dim());
+		nano_print_line_number(i + 1, digits);
+		console_set_color(console_color_default());
 		console_writestring(nb->lines[i]);
 		console_putchar('\n');
 	}
 
-	console_set_cursor(nb->cur_col, NANO_HEADER_ROWS + (nb->cur_line - visible_start));
+	console_set_cursor(gutter + nb->cur_col, NANO_HEADER_ROWS + (nb->cur_line - visible_start));
 }
 
 static void cmd_nano(const char *filename) {
