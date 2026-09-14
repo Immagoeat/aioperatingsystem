@@ -2,21 +2,29 @@
  * mkdir, echo (with file redirection), nano (a small full-screen text
  * editor), compile, and run. Delegated to from shell.c's dispatch().
  *
- * Directory nesting: exactly two levels are supported - the root
- * directory, and subdirectories directly under it (`cd DIRNAME` from
- * root, `cd ..` back to root). Deeper nesting isn't implemented; FAT16
- * itself supports arbitrary depth, but only this shallower shape has
- * actually been exercised/verified here, and claiming more than that
- * would be a real correctness risk for exactly the kind of mistake this
- * feature was asked not to have.
+ * Directory nesting: arbitrary depth (up to PATH_STACK_MAX levels),
+ * tracked as a real stack of (cluster, name) pairs - `cd DIR` pushes a
+ * level, `cd ..` pops one, `cd`/`cd /` resets straight to root. FAT16
+ * itself has no depth limit; fat16_create()/fat16_list()/etc. already
+ * take an arbitrary dir_cluster and don't rely on "." or ".." entries
+ * existing, so nothing in the filesystem layer itself needed to change
+ * for this - the old one-level cap was purely this file's own gating.
  */
 #include "kernel.h"
 
 #define MAX_PATH_NAME 32
+#define PATH_STACK_MAX 16 /* generous - deeper than any reasonable use, and a fixed cap since there's no dynamic allocation here */
 
-/* 0 = root; non-zero = the first_cluster of the current subdirectory */
-static uint16_t cwd_cluster = 0;
-static char cwd_name[MAX_PATH_NAME] = ""; /* empty when at root */
+struct path_entry {
+	uint16_t cluster;
+	char name[MAX_PATH_NAME];
+};
+static struct path_entry path_stack[PATH_STACK_MAX];
+static int path_depth = 0; /* 0 = at root */
+
+static uint16_t cwd_cluster(void) {
+	return path_depth == 0 ? 0 : path_stack[path_depth - 1].cluster;
+}
 
 static void local_strncpy_term(char *dst, const char *src, size_t n) {
 	size_t i = 0;
@@ -35,9 +43,9 @@ static bool fs_ready(void) {
 }
 
 void terminal_print_cwd_prompt_suffix(void) {
-	if (cwd_name[0]) {
+	for (int i = 0; i < path_depth; i++) {
 		console_putchar('/');
-		console_writestring(cwd_name);
+		console_writestring(path_stack[i].name);
 	}
 }
 
@@ -64,7 +72,7 @@ static void ls_print_entry(const char *name, bool is_dir, uint32_t size, void *u
 static void cmd_ls(void) {
 	if (!fs_ready()) return;
 	struct ls_ctx ctx = { 0 };
-	fat16_list(cwd_cluster, ls_print_entry, &ctx);
+	fat16_list(cwd_cluster(), ls_print_entry, &ctx);
 	if (ctx.count == 0) console_writestring("(empty)\n");
 }
 
@@ -72,25 +80,18 @@ static void cmd_ls(void) {
 
 static void cmd_cd(const char *arg) {
 	if (!fs_ready()) return;
-	if (!arg || arg[0] == '\0') {
-		cwd_cluster = 0;
-		cwd_name[0] = '\0';
+	if (!arg || arg[0] == '\0' || strcmp(arg, "/") == 0) {
+		path_depth = 0; /* plain `cd` or `cd /`: reset straight to root */
 		return;
 	}
 
-	if (strcmp(arg, "..") == 0 || strcmp(arg, "/") == 0) {
-		cwd_cluster = 0;
-		cwd_name[0] = '\0';
-		return;
-	}
-
-	if (cwd_cluster != 0) {
-		console_writestring("Only one level of directories is supported; run 'cd ..' first.\n");
+	if (strcmp(arg, "..") == 0) {
+		if (path_depth > 0) path_depth--; /* pop one real level, not always straight to root */
 		return;
 	}
 
 	struct fat16_entry entry;
-	if (!fat16_stat(0, arg, &entry)) {
+	if (!fat16_stat(cwd_cluster(), arg, &entry)) {
 		console_writestring("No such directory: ");
 		console_writestring(arg);
 		console_putchar('\n');
@@ -101,9 +102,16 @@ static void cmd_cd(const char *arg) {
 		console_writestring(" is not a directory.\n");
 		return;
 	}
+	if (path_depth >= PATH_STACK_MAX) {
+		console_writestring("Too deeply nested (max ");
+		kprintf("%d", PATH_STACK_MAX);
+		console_writestring(" levels).\n");
+		return;
+	}
 
-	cwd_cluster = entry.first_cluster;
-	local_strncpy_term(cwd_name, arg, sizeof(cwd_name) - 1);
+	path_stack[path_depth].cluster = entry.first_cluster;
+	local_strncpy_term(path_stack[path_depth].name, arg, MAX_PATH_NAME - 1);
+	path_depth++;
 }
 
 /* --- mkdir / touch / rm --- */
@@ -111,8 +119,7 @@ static void cmd_cd(const char *arg) {
 static void cmd_mkdir(const char *arg) {
 	if (!fs_ready()) return;
 	if (!arg || arg[0] == '\0') { console_writestring("usage: mkdir NAME\n"); return; }
-	if (cwd_cluster != 0) { console_writestring("mkdir only works from the root directory.\n"); return; }
-	if (!fat16_create(cwd_cluster, arg, true)) {
+	if (!fat16_create(cwd_cluster(), arg, true)) {
 		console_writestring("Could not create directory (disk full, or name too long for 8.3).\n");
 	}
 }
@@ -120,7 +127,7 @@ static void cmd_mkdir(const char *arg) {
 static void cmd_touch(const char *arg) {
 	if (!fs_ready()) return;
 	if (!arg || arg[0] == '\0') { console_writestring("usage: touch NAME\n"); return; }
-	if (!fat16_create(cwd_cluster, arg, false)) {
+	if (!fat16_create(cwd_cluster(), arg, false)) {
 		console_writestring("Could not create file (disk full, or name too long for 8.3).\n");
 	}
 }
@@ -128,7 +135,7 @@ static void cmd_touch(const char *arg) {
 static void cmd_rm(const char *arg) {
 	if (!fs_ready()) return;
 	if (!arg || arg[0] == '\0') { console_writestring("usage: rm NAME\n"); return; }
-	if (!fat16_delete(cwd_cluster, arg)) {
+	if (!fat16_delete(cwd_cluster(), arg)) {
 		console_writestring("No such file: ");
 		console_writestring(arg);
 		console_putchar('\n');
@@ -142,7 +149,7 @@ static void cmd_cat(const char *arg) {
 	if (!arg || arg[0] == '\0') { console_writestring("usage: cat NAME\n"); return; }
 
 	struct fat16_entry entry;
-	if (!fat16_stat(cwd_cluster, arg, &entry) || entry.is_dir) {
+	if (!fat16_stat(cwd_cluster(), arg, &entry) || entry.is_dir) {
 		console_writestring("No such file: ");
 		console_writestring(arg);
 		console_putchar('\n');
@@ -182,7 +189,7 @@ static void cmd_echo_maybe_redirect(char *rest) {
 	if (!fs_ready()) return;
 	if (*filename == '\0') { console_writestring("usage: echo TEXT > filename\n"); return; }
 
-	if (!fat16_write_file(cwd_cluster, filename, rest, (uint32_t)text_len)) {
+	if (!fat16_write_file(cwd_cluster(), filename, rest, (uint32_t)text_len)) {
 		console_writestring("Could not write file.\n");
 	}
 }
@@ -282,7 +289,7 @@ static void cmd_nano(const char *filename) {
 	if (!filename || filename[0] == '\0') { console_writestring("usage: nano FILENAME\n"); return; }
 
 	static struct note_buffer nb;
-	note_load(&nb, cwd_cluster, filename);
+	note_load(&nb, cwd_cluster(), filename);
 	nano_redraw(&nb, filename);
 	console_present();
 
@@ -298,7 +305,7 @@ static void cmd_nano(const char *filename) {
 				console_putchar('\n');
 				console_present();
 				if (answer == 'y' || answer == 'Y') {
-					if (!note_save(&nb, cwd_cluster, filename)) {
+					if (!note_save(&nb, cwd_cluster(), filename)) {
 						console_writestring("Save failed; not exiting.\n");
 						console_present();
 						continue;
@@ -307,7 +314,7 @@ static void cmd_nano(const char *filename) {
 			}
 			break;
 		} else if (c == CTRL_KEY('s')) {
-			if (!note_save(&nb, cwd_cluster, filename)) {
+			if (!note_save(&nb, cwd_cluster(), filename)) {
 				console_writestring("\nSave failed (disk full or name invalid).\n");
 			}
 			nano_redraw(&nb, filename);
@@ -329,7 +336,7 @@ static void cmd_compile(const char *filename) {
 	if (!filename || filename[0] == '\0') { console_writestring("usage: compile SOURCE.asm\n"); return; }
 
 	struct fat16_entry entry;
-	if (!fat16_stat(cwd_cluster, filename, &entry) || entry.is_dir) {
+	if (!fat16_stat(cwd_cluster(), filename, &entry) || entry.is_dir) {
 		console_writestring("No such file: ");
 		console_writestring(filename);
 		console_putchar('\n');
@@ -362,7 +369,7 @@ static void cmd_compile(const char *filename) {
 	out_name[i] = '\0';
 	strcat(out_name, ".bin");
 
-	if (!fat16_write_file(cwd_cluster, out_name, code, code_len)) {
+	if (!fat16_write_file(cwd_cluster(), out_name, code, code_len)) {
 		console_writestring("Compiled OK, but could not write output file.\n");
 		return;
 	}
@@ -375,7 +382,7 @@ static void cmd_run(const char *filename) {
 	if (!filename || filename[0] == '\0') { console_writestring("usage: run PROGRAM.bin\n"); return; }
 
 	struct fat16_entry entry;
-	if (!fat16_stat(cwd_cluster, filename, &entry) || entry.is_dir) {
+	if (!fat16_stat(cwd_cluster(), filename, &entry) || entry.is_dir) {
 		console_writestring("No such file: ");
 		console_writestring(filename);
 		console_putchar('\n');

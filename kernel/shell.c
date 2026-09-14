@@ -57,8 +57,8 @@ static void cmd_help(bool from_gui) {
 	console_writestring("  halt          - halt the CPU\n");
 	console_writestring("\nFilesystem (needs a data disk; see README):\n");
 	console_writestring("  ls                    - list files in the current directory\n");
-	console_writestring("  cd NAME | cd ..       - change directory (one level deep)\n");
-	console_writestring("  mkdir NAME            - create a directory (from root only)\n");
+	console_writestring("  cd NAME | cd .. | cd  - change directory (any depth) / go up / go to root\n");
+	console_writestring("  mkdir NAME            - create a directory (in the current directory)\n");
 	console_writestring("  touch NAME            - create an empty file\n");
 	console_writestring("  rm NAME               - delete a file or empty directory\n");
 	console_writestring("  cat NAME              - print a file's contents\n");
