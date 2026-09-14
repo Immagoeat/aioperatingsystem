@@ -811,6 +811,119 @@ static bool parse_ipv4(const char *s, uint32_t *out) {
 	return true;
 }
 
+/* Case-insensitive substring search within the first `header_len`
+ * bytes of `response` - used to spot a header by name without a real
+ * header parser (no memcmp/strcasestr in this kernel's minimal libc). */
+static bool http_header_contains_ci(const uint8_t *response, uint32_t header_len, const char *needle) {
+	uint32_t needle_len = (uint32_t)strlen(needle);
+	if (needle_len == 0 || needle_len > header_len) return false;
+	for (uint32_t i = 0; i + needle_len <= header_len; i++) {
+		bool match = true;
+		for (uint32_t j = 0; j < needle_len; j++) {
+			char a = (char)response[i + j];
+			char b = needle[j];
+			if (a >= 'A' && a <= 'Z') a += 32;
+			if (b >= 'A' && b <= 'Z') b += 32;
+			if (a != b) { match = false; break; }
+		}
+		if (match) return true;
+	}
+	return false;
+}
+
+/* Decodes an HTTP/1.1 chunked-transfer-encoded body (RFC 7230 SS4.1)
+ * in place: chunk-size (hex) CRLF, chunk-data, CRLF, repeated, then a
+ * final 0-size chunk. No chunk extensions or trailers beyond skipping
+ * past them - real servers essentially never send extensions, and
+ * trailers (rare, generally only with the "trailer" header
+ * pre-negotiated) aren't needed for this client's purposes. */
+static uint32_t http_decode_chunked(const uint8_t *in, uint32_t in_len, uint8_t *out, uint32_t out_max) {
+	uint32_t i = 0, out_len = 0;
+	while (i < in_len) {
+		uint32_t chunk_size = 0;
+		bool any_digit = false;
+		while (i < in_len && in[i] != '\r' && in[i] != '\n' && in[i] != ';') {
+			char c = (char)in[i];
+			uint32_t digit;
+			if (c >= '0' && c <= '9') digit = (uint32_t)(c - '0');
+			else if (c >= 'a' && c <= 'f') digit = (uint32_t)(c - 'a' + 10);
+			else if (c >= 'A' && c <= 'F') digit = (uint32_t)(c - 'A' + 10);
+			else break; /* malformed - stop parsing this chunk size */
+			chunk_size = chunk_size * 16 + digit;
+			any_digit = true;
+			i++;
+		}
+		if (!any_digit) break; /* malformed chunked body - return what's been decoded so far */
+		while (i < in_len && in[i] != '\n') i++; /* skip any chunk-extensions and the rest of the line */
+		if (i < in_len) i++; /* consume '\n' */
+
+		if (chunk_size == 0) break; /* final chunk - trailers (if any) follow, not needed */
+		if (i + chunk_size > in_len) chunk_size = in_len - i; /* truncated response - take what's there */
+
+		uint32_t copy_len = chunk_size;
+		if (out_len + copy_len > out_max) copy_len = out_max - out_len;
+		memcpy(out + out_len, in + i, copy_len);
+		out_len += copy_len;
+		i += chunk_size;
+
+		if (i < in_len && in[i] == '\r') i++;
+		if (i < in_len && in[i] == '\n') i++;
+
+		if (out_len >= out_max) break;
+	}
+	return out_len;
+}
+
+/* Splits a raw HTTP response into just its body, checking for a 2xx
+ * status line along the way. Shared by net_http_get (above) and
+ * net_https_get (below) - both read a raw response into a buffer
+ * first (over plain TCP or over TLS respectively) and then need this
+ * exact same framing logic. */
+static bool http_extract_body(const uint8_t *response, uint32_t response_len, void *out_body, uint32_t max_body_len, uint32_t *out_body_len, char *out_error, uint32_t out_error_len) {
+	uint32_t body_start = 0;
+	for (uint32_t i = 0; i + 3 < response_len; i++) {
+		if (response[i] == '\r' && response[i + 1] == '\n' && response[i + 2] == '\r' && response[i + 3] == '\n') {
+			body_start = i + 4;
+			break;
+		}
+	}
+	if (body_start == 0) {
+		local_strcpy_bounded(out_error, "Malformed HTTP response (no header/body separator found).", out_error_len);
+		return false;
+	}
+
+	bool starts_with_http = response_len >= 12;
+	if (starts_with_http) {
+		static const char prefix[7] = "HTTP/1.";
+		for (int i = 0; i < 7; i++) {
+			if (response[i] != (uint8_t)prefix[i]) { starts_with_http = false; break; }
+		}
+	}
+	if (!starts_with_http || response[9] != '2') {
+		char status_line[64];
+		uint32_t sl_len = 0;
+		while (sl_len < response_len && response[sl_len] != '\r' && sl_len < sizeof(status_line) - 1) {
+			status_line[sl_len] = (char)response[sl_len];
+			sl_len++;
+		}
+		status_line[sl_len] = '\0';
+		local_strcpy_bounded(out_error, status_line[0] ? status_line : "Non-2xx HTTP response.", out_error_len);
+		return false;
+	}
+
+	bool chunked = http_header_contains_ci(response, body_start, "Transfer-Encoding: chunked");
+
+	if (chunked) {
+		*out_body_len = http_decode_chunked(response + body_start, response_len - body_start, (uint8_t *)out_body, max_body_len);
+	} else {
+		uint32_t body_len = response_len - body_start;
+		if (body_len > max_body_len) body_len = max_body_len;
+		memcpy(out_body, response + body_start, body_len);
+		*out_body_len = body_len;
+	}
+	return true;
+}
+
 bool net_http_get(const char *host_ip_str, uint16_t port, const char *path, void *out_body, uint32_t max_body_len, uint32_t *out_body_len, char *out_error, uint32_t out_error_len) {
 	*out_body_len = 0;
 
@@ -884,47 +997,64 @@ bool net_http_get(const char *host_ip_str, uint16_t port, const char *path, void
 		return false;
 	}
 
-	/* Split the status line + headers from the body at the first blank
-	 * line (CRLF CRLF), per RFC 7230 - this is the one piece of real
-	 * HTTP framing this client needs to understand to hand back just
-	 * the body, not the whole raw response. */
-	uint32_t body_start = 0;
-	for (uint32_t i = 0; i + 3 < response_len; i++) {
-		if (response[i] == '\r' && response[i + 1] == '\n' && response[i + 2] == '\r' && response[i + 3] == '\n') {
-			body_start = i + 4;
-			break;
-		}
-	}
-	if (body_start == 0) {
-		local_strcpy_bounded(out_error, "Malformed HTTP response (no header/body separator found).", out_error_len);
+	/* Split the status line + headers from the body (RFC 7230) and
+	 * check for a 2xx status, via the shared helper net_https_get below
+	 * also uses. */
+	return http_extract_body(response, response_len, out_body, max_body_len, out_body_len, out_error, out_error_len);
+}
+
+/* Same as net_http_get, but over TLS 1.2 (see tls.c) - this is what a
+ * real https:// URL needs. host_ip must still be a literal IPv4
+ * address already resolved via net_resolve_hostname(); hostname is
+ * used both for the TLS SNI extension and to check the server
+ * certificate's CN, and also becomes the Host: header. */
+bool net_https_get(uint32_t host_ip, const char *hostname, uint16_t port, const char *path, void *out_body, uint32_t max_body_len, uint32_t *out_body_len, char *out_error, uint32_t out_error_len) {
+	*out_body_len = 0;
+
+	if (!have_lease) {
+		local_strcpy_bounded(out_error, "Not connected (no DHCP lease) - run netconnect first.", out_error_len);
 		return false;
 	}
 
-	/* A real (if minimal) status-line check: refuse to save an error
-	 * page's body as if it were the requested file. No memcmp() in this
-	 * kernel's minimal libc, so just compare the few bytes by hand. */
-	bool starts_with_http = response_len >= 12;
-	if (starts_with_http) {
-		static const char prefix[7] = "HTTP/1.";
-		for (int i = 0; i < 7; i++) {
-			if (response[i] != (uint8_t)prefix[i]) { starts_with_http = false; break; }
-		}
-	}
-	if (!starts_with_http || response[9] != '2') {
-		char status_line[64];
-		uint32_t sl_len = 0;
-		while (sl_len < response_len && response[sl_len] != '\r' && sl_len < sizeof(status_line) - 1) {
-			status_line[sl_len] = (char)response[sl_len];
-			sl_len++;
-		}
-		status_line[sl_len] = '\0';
-		local_strcpy_bounded(out_error, status_line[0] ? status_line : "Non-2xx HTTP response.", out_error_len);
+	struct tls_ctx ctx;
+	if (!tls_connect(&ctx, host_ip, port, hostname, out_error, out_error_len)) {
 		return false;
 	}
 
-	uint32_t body_len = response_len - body_start;
-	if (body_len > max_body_len) body_len = max_body_len;
-	memcpy(out_body, response + body_start, body_len);
-	*out_body_len = body_len;
-	return true;
+	char request[512];
+	int req_len = 0;
+	{
+		const char *parts[] = { "GET ", path, " HTTP/1.1\r\nHost: ", hostname, "\r\nConnection: close\r\nUser-Agent: auroraOS\r\n\r\n" };
+		for (int i = 0; i < 5; i++) {
+			for (const char *p = parts[i]; *p && req_len < (int)sizeof(request) - 1; p++) request[req_len++] = *p;
+		}
+	}
+
+	if (!tls_send(&ctx, (const uint8_t *)request, (uint32_t)req_len)) {
+		local_strcpy_bounded(out_error, "Failed to send HTTPS request.", out_error_len);
+		tls_close(&ctx);
+		return false;
+	}
+
+	static uint8_t response[65536];
+	uint32_t response_len = 0;
+	uint8_t chunk[4096];
+
+	for (;;) {
+		uint32_t chunk_len = 0;
+		if (!tls_recv(&ctx, chunk, sizeof(chunk), &chunk_len)) break; /* clean close, alert, or timeout - either way, done */
+		if (chunk_len > 0 && response_len + chunk_len <= sizeof(response)) {
+			memcpy(response + response_len, chunk, chunk_len);
+			response_len += chunk_len;
+		}
+	}
+
+	tls_close(&ctx);
+
+	if (response_len == 0) {
+		local_strcpy_bounded(out_error, "No response received (timed out).", out_error_len);
+		return false;
+	}
+
+	return http_extract_body(response, response_len, out_body, max_body_len, out_body_len, out_error, out_error_len);
 }

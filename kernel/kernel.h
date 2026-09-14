@@ -114,6 +114,14 @@ bool net_resolve_hostname(const char *hostname, uint32_t *out_ip, char *out_erro
  * four-way close - not a loopback/simulated transfer. */
 bool net_http_get(const char *host_ip_str, uint16_t port, const char *path, void *out_body, uint32_t max_body_len, uint32_t *out_body_len, char *out_error, uint32_t out_error_len);
 
+/* Same as net_http_get, but over TLS 1.2 (tls.c) - what a real
+ * https:// URL needs. host_ip must already be resolved (e.g. via
+ * net_resolve_hostname()); hostname drives both the TLS SNI extension
+ * and the server certificate's CN check, and becomes the Host:
+ * header. See tls.c's file comment for this client's real limitations
+ * (no root-CA/chain validation - hostname-vs-CN only). */
+bool net_https_get(uint32_t host_ip, const char *hostname, uint16_t port, const char *path, void *out_body, uint32_t max_body_len, uint32_t *out_body_len, char *out_error, uint32_t out_error_len);
+
 /* --- netinfo.c: honest network hardware status for the GUI's network
  * panel: what's actually attached (via pci.c), and whether there's a
  * real driver behind it (only the e1000, via e1000.c/net.c - still no
@@ -461,6 +469,23 @@ struct wallpaper {
 int wallpaper_count(void);
 const struct wallpaper *wallpaper_get(int index);
 void wallpaper_draw(int index, int dst_w, int dst_h);
+
+/* --- html.c: a minimal HTML-to-text renderer for the browser app in
+ * wm.c - see html.c's file comment for exactly what it does and
+ * doesn't handle (no CSS, no images, no tables, no variable font
+ * sizes; <script>/<style> contents are skipped rather than rendered
+ * as garbage). */
+#define HTML_MAX_LINES 2048
+#define HTML_LINE_MAX 256
+#define HTML_TEXT_MAX (64 * 1024)
+#define HTML_TITLE_MAX 128
+
+struct html_page {
+	char title[HTML_TITLE_MAX];
+	char lines[HTML_MAX_LINES][HTML_LINE_MAX];
+	int line_count;
+};
+void html_layout(const uint8_t *html_bytes, uint32_t html_len, struct html_page *page, int wrap_cols);
 
 /* --- wm.c --- */
 void wm_init(void);

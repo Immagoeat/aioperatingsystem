@@ -33,6 +33,41 @@ static void local_strcpy_bounded_tls(char *dst, const char *src, uint32_t n) {
 	dst[i] = '\0';
 }
 
+/* Decodes a TLS alert description byte (RFC 5246 SS7.2) into text, so a
+ * server-sent alert shows up as an actual reason instead of just
+ * "connection closed" or a generic "didn't get what I expected"
+ * message at whatever recv call happened to receive it. */
+static const char *tls_alert_name(uint8_t description) {
+	switch (description) {
+		case 0: return "close_notify";
+		case 10: return "unexpected_message";
+		case 20: return "bad_record_mac";
+		case 21: return "decryption_failed";
+		case 22: return "record_overflow";
+		case 30: return "decompression_failure";
+		case 40: return "handshake_failure";
+		case 41: return "no_certificate";
+		case 42: return "bad_certificate";
+		case 43: return "unsupported_certificate";
+		case 44: return "certificate_revoked";
+		case 45: return "certificate_expired";
+		case 46: return "certificate_unknown";
+		case 47: return "illegal_parameter";
+		case 48: return "unknown_ca";
+		case 49: return "access_denied";
+		case 50: return "decode_error";
+		case 51: return "decrypt_error";
+		case 60: return "export_restriction";
+		case 70: return "protocol_version";
+		case 71: return "insufficient_security";
+		case 80: return "internal_error";
+		case 90: return "user_canceled";
+		case 100: return "no_renegotiation";
+		case 110: return "unsupported_extension";
+		default: return "unknown";
+	}
+}
+
 #define TLS_CONTENT_CHANGE_CIPHER_SPEC 20
 #define TLS_CONTENT_ALERT              21
 #define TLS_CONTENT_HANDSHAKE          22
@@ -106,7 +141,16 @@ static bool tls_send_record(struct tls_conn *tls, uint8_t content_type, const ui
 		record[3] = (uint8_t)(payload_len >> 8);
 		record[4] = (uint8_t)(payload_len);
 		memcpy(record + 5, payload, payload_len);
-		return tcp_send_segment(&tls->tcp, TCP_FLAG_PSH | TCP_FLAG_ACK, record, (uint16_t)(5 + payload_len));
+		uint16_t wire_len = (uint16_t)(5 + payload_len);
+		if (!tcp_send_segment(&tls->tcp, TCP_FLAG_PSH | TCP_FLAG_ACK, record, wire_len)) return false;
+		/* tcp_send_segment() doesn't advance the connection's sequence
+		 * number itself (see net_http_get() in net.c, which does the same
+		 * by hand after its one send) - every byte actually put on the
+		 * wire, TLS record header included, has to count here or the next
+		 * record we send reuses a sequence number the peer has already
+		 * seen and gets treated as a retransmission/duplicate. */
+		tls->tcp.local_seq += wire_len;
+		return true;
 	}
 
 	/* MAC input: seq_num(8) || type(1) || version(2) || length(2) || payload - RFC 5246 6.2.3.1 */
@@ -155,7 +199,10 @@ static bool tls_send_record(struct tls_conn *tls, uint8_t content_type, const ui
 	memcpy(record + 5 + 16, ciphertext, plaintext_len);
 
 	tls->write_seq_num++;
-	return tcp_send_segment(&tls->tcp, TCP_FLAG_PSH | TCP_FLAG_ACK, record, (uint16_t)(5 + record_payload_len));
+	uint16_t wire_len = (uint16_t)(5 + record_payload_len);
+	if (!tcp_send_segment(&tls->tcp, TCP_FLAG_PSH | TCP_FLAG_ACK, record, wire_len)) return false;
+	tls->tcp.local_seq += wire_len; /* see the matching comment in the unencrypted path above */
+	return true;
 }
 
 #define TLS_RECV_TIMEOUT_TICKS 500
@@ -364,6 +411,16 @@ bool tls_connect(struct tls_ctx *ctx, uint32_t remote_ip, uint16_t port, const c
 			tcp_close(&tls.tcp);
 			return false;
 		}
+		if (content_type == TLS_CONTENT_ALERT) {
+			char msg[96];
+			const char *parts[] = { "Server sent alert: ", record_payload_len >= 2 ? tls_alert_name(record_payload[1]) : "malformed alert" };
+			uint32_t mp = 0;
+			for (int pi = 0; pi < 2; pi++) for (const char *p = parts[pi]; *p && mp < sizeof(msg) - 1; p++) msg[mp++] = *p;
+			msg[mp] = '\0';
+			local_strcpy_bounded_tls(out_error, msg, out_error_len);
+			tcp_close(&tls.tcp);
+			return false;
+		}
 		if (content_type != TLS_CONTENT_HANDSHAKE) continue;
 		if (flight_len + record_payload_len > sizeof(flight)) {
 			local_strcpy_bounded_tls(out_error, "Server handshake too large for this client.", out_error_len);
@@ -509,9 +566,23 @@ bool tls_connect(struct tls_ctx *ctx, uint32_t remote_ip, uint16_t port, const c
 	}
 
 	/* --- verify the server's ChangeCipherSpec + Finished --- */
-	if (!tls_recv_record(&tls, &content_type, record_payload, &record_payload_len, sizeof(record_payload), false) ||
-	    content_type != TLS_CONTENT_CHANGE_CIPHER_SPEC) {
-		local_strcpy_bounded_tls(out_error, "Did not receive the server's ChangeCipherSpec.", out_error_len);
+	if (!tls_recv_record(&tls, &content_type, record_payload, &record_payload_len, sizeof(record_payload), false)) {
+		local_strcpy_bounded_tls(out_error, "Did not receive the server's ChangeCipherSpec (timed out).", out_error_len);
+		tcp_close(&tls.tcp);
+		return false;
+	}
+	if (content_type == TLS_CONTENT_ALERT) {
+		char msg[96];
+		const char *parts[] = { "Server sent alert: ", record_payload_len >= 2 ? tls_alert_name(record_payload[1]) : "malformed alert" };
+		uint32_t mp = 0;
+		for (int pi = 0; pi < 2; pi++) for (const char *p = parts[pi]; *p && mp < sizeof(msg) - 1; p++) msg[mp++] = *p;
+		msg[mp] = '\0';
+		local_strcpy_bounded_tls(out_error, msg, out_error_len);
+		tcp_close(&tls.tcp);
+		return false;
+	}
+	if (content_type != TLS_CONTENT_CHANGE_CIPHER_SPEC) {
+		local_strcpy_bounded_tls(out_error, "Did not receive the server's ChangeCipherSpec (unexpected message).", out_error_len);
 		tcp_close(&tls.tcp);
 		return false;
 	}

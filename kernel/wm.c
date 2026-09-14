@@ -378,6 +378,218 @@ static void key_texteditor(struct window *w, char c) {
 	}
 }
 
+/* --- Browser: a real (if very basic) web browser. Address bar ->
+ * net_resolve_hostname() (DNS) -> net_http_get() or net_https_get()
+ * (plain HTTP or TLS 1.2, by scheme) -> html_layout() (html.c) -> a
+ * scrollable rendered page. See html.c's and tls.c's file comments
+ * for the honest limitations (no CSS/images/tables/JS; no
+ * certificate-chain validation). Per-window state, same one-slot-per-
+ * open-window pattern as Text Editor. */
+#define BROWSER_URL_MAX 192
+#define BROWSER_HOST_MAX 128
+#define BROWSER_PATH_MAX 192
+#define BROWSER_BODY_MAX (64 * 1024)
+
+struct browser_state {
+	char url[BROWSER_URL_MAX];
+	int url_len;
+	bool editing_url; /* true while the address bar has focus (always, except while a page is displayed and the user is scrolling - Ctrl+L refocuses it) */
+
+	bool has_page;
+	struct html_page page;
+	int scroll;
+
+	bool loading;
+	bool pending_load; /* true for exactly one frame: "Loading..." has been requested but the (blocking, possibly multi-second) fetch hasn't started yet - see wm_run()'s main loop, which checks this right after gfx_flip() so "Loading..." actually reaches the screen before the fetch blocks everything */
+	bool has_error;
+	char error[128];
+};
+static struct browser_state browser[MAX_WINDOWS];
+static uint8_t browser_body[BROWSER_BODY_MAX]; /* one fetch at a time overall (this OS has no real concurrency) - shared, not per-window */
+
+/* Splits "[http://|https://]host[:port][/path]" into its pieces.
+ * Defaults: scheme http, port 80 (or 443 for https), path "/". No
+ * userinfo, no query-string handling beyond passing it through as
+ * part of the path, no IPv6 literals - a real but minimal URL parser. */
+struct parsed_url {
+	bool https;
+	char host[BROWSER_HOST_MAX];
+	uint16_t port;
+	char path[BROWSER_PATH_MAX];
+};
+
+static bool browser_parse_url(const char *url, struct parsed_url *out) {
+	out->https = false;
+	out->port = 80;
+	strcpy(out->path, "/");
+
+	const char *p = url;
+	if (strncmp(p, "https://", 8) == 0) { out->https = true; out->port = 443; p += 8; }
+	else if (strncmp(p, "http://", 7) == 0) { p += 7; }
+
+	if (*p == '\0') return false;
+
+	uint32_t host_len = 0;
+	while (*p && *p != '/' && *p != ':' && host_len < BROWSER_HOST_MAX - 1) {
+		out->host[host_len++] = *p++;
+	}
+	out->host[host_len] = '\0';
+	if (host_len == 0) return false;
+
+	if (*p == ':') {
+		p++;
+		uint32_t port_val = 0;
+		while (*p >= '0' && *p <= '9') { port_val = port_val * 10 + (uint32_t)(*p - '0'); p++; }
+		if (port_val == 0 || port_val > 65535) return false;
+		out->port = (uint16_t)port_val;
+	}
+
+	if (*p == '/') {
+		uint32_t path_len = 0;
+		while (*p && path_len < BROWSER_PATH_MAX - 1) out->path[path_len++] = *p++;
+		out->path[path_len] = '\0';
+	}
+
+	return true;
+}
+
+static void browser_load(struct window *w) {
+	int idx = (int)(w - windows);
+	struct browser_state *st = &browser[idx];
+
+	st->has_page = false;
+	st->has_error = false;
+	st->scroll = 0;
+
+	struct parsed_url u;
+	if (!browser_parse_url(st->url, &u)) {
+		st->has_error = true;
+		strcpy(st->error, "Invalid URL. Try: http://host/path or https://host/path");
+		return;
+	}
+
+	uint32_t ip;
+	char neterr[96];
+	if (!net_resolve_hostname(u.host, &ip, neterr, sizeof(neterr))) {
+		st->has_error = true;
+		strcpy(st->error, neterr);
+		return;
+	}
+
+	char ip_str[16];
+	{
+		const uint8_t *b = (const uint8_t *)&ip;
+		int pos = 0;
+		for (int i = 0; i < 4; i++) {
+			uint8_t v = b[i];
+			if (v >= 100) ip_str[pos++] = (char)('0' + v / 100);
+			if (v >= 10) ip_str[pos++] = (char)('0' + (v / 10) % 10);
+			ip_str[pos++] = (char)('0' + v % 10);
+			if (i < 3) ip_str[pos++] = '.';
+		}
+		ip_str[pos] = '\0';
+	}
+
+	uint32_t body_len = 0;
+	bool ok;
+	if (u.https) {
+		ok = net_https_get(ip, u.host, u.port, u.path, browser_body, sizeof(browser_body), &body_len, neterr, sizeof(neterr));
+	} else {
+		ok = net_http_get(ip_str, u.port, u.path, browser_body, sizeof(browser_body), &body_len, neterr, sizeof(neterr));
+	}
+
+	if (!ok) {
+		st->has_error = true;
+		strcpy(st->error, neterr);
+		return;
+	}
+
+	int wrap_cols = (w->w - 2 * PADDING) / gfx_char_width();
+	html_layout(browser_body, body_len, &st->page, wrap_cols);
+	st->has_page = true;
+}
+
+static void paint_browser(struct window *w) {
+	int idx = (int)(w - windows);
+	struct browser_state *st = &browser[idx];
+	int x = w->x + PADDING, y = w->y + TITLEBAR_H + PADDING;
+	int lh = gfx_char_height() + 4;
+
+	/* address bar */
+	int field_w = w->w - 2 * PADDING;
+	int field_h = 30;
+	gfx_fill_round_rect(x, y, field_w, field_h, 6, st->editing_url ? COL_WIN_BODY_ALT : COL_TASKBAR);
+	const char *shown = st->url_len > 0 ? st->url : "Type a URL and press Enter (e.g. http://93.184.216.34/)";
+	gfx_draw_string(x + 10, y + (field_h - gfx_char_height()) / 2, shown, st->url_len > 0 ? COL_TEXT : COL_TEXT_DIM);
+	if (st->editing_url && ((timer_get_ticks() / 30) % 2) == 0) {
+		int cursor_x = x + 10 + gfx_string_width(st->url);
+		gfx_fill_rect(cursor_x + 2, y + 5, 2, field_h - 10, w->accent);
+	}
+	y += field_h + 10;
+
+	if (st->loading) {
+		gfx_draw_string(x, y, "Loading...", COL_TEXT_DIM);
+		return;
+	}
+
+	if (st->has_error) {
+		gfx_draw_string(x, y, "Error:", GFX_RGB(0xFF, 0x6B, 0x6B));
+		y += lh + 4;
+		gfx_draw_string(x, y, st->error, COL_TEXT_DIM);
+		return;
+	}
+
+	if (!st->has_page) {
+		gfx_draw_string(x, y, "Enter an address above, then press Enter.", COL_TEXT_DIM);
+		return;
+	}
+
+	if (st->page.title[0]) {
+		gfx_draw_string(x, y, st->page.title, w->accent);
+		y += lh + 6;
+	}
+
+	int content_top = y;
+	int max_visible = (w->h + TITLEBAR_H - (content_top - w->y) - PADDING) / lh;
+	if (max_visible < 1) max_visible = 1;
+
+	if (st->scroll > st->page.line_count - max_visible) st->scroll = st->page.line_count - max_visible;
+	if (st->scroll < 0) st->scroll = 0;
+
+	for (int i = st->scroll; i < st->page.line_count && i < st->scroll + max_visible; i++) {
+		gfx_draw_string(x, y, st->page.lines[i], COL_TEXT);
+		y += lh;
+	}
+}
+
+static void key_browser(struct window *w, char c) {
+	int idx = (int)(w - windows);
+	struct browser_state *st = &browser[idx];
+
+	if (c == CTRL_KEY('l')) {
+		st->editing_url = true;
+		return;
+	}
+
+	if (st->editing_url) {
+		if (c == '\n') {
+			if (st->url_len == 0) return;
+			st->editing_url = false;
+			st->loading = true;
+			st->pending_load = true; /* actually fetched from wm_run(), once this "Loading..." state has had a chance to reach the screen */
+		} else if (c == '\b') {
+			if (st->url_len > 0) st->url[--st->url_len] = '\0';
+		} else if (c >= 32 && c < 127 && st->url_len < BROWSER_URL_MAX - 1) {
+			st->url[st->url_len++] = c;
+			st->url[st->url_len] = '\0';
+		}
+		return;
+	}
+
+	if (c == KEY_ARROW_UP) { if (st->scroll > 0) st->scroll--; }
+	else if (c == KEY_ARROW_DOWN) { st->scroll++; }
+}
+
 static int create_window(int x, int y, int w, int h, const char *title, window_paint_fn paint, window_key_fn key, gfx_color_t accent) {
 	for (int i = 0; i < MAX_WINDOWS; i++) {
 		if (!windows[i].used) {
@@ -468,6 +680,9 @@ static void window_opened(int idx, const char *app_name) {
 	} else if (strcmp(app_name, "Text Editor") == 0) {
 		memset(&texteditor[idx], 0, sizeof(texteditor[idx]));
 		texteditor[idx].picking_filename = true;
+	} else if (strcmp(app_name, "Browser") == 0) {
+		memset(&browser[idx], 0, sizeof(browser[idx]));
+		browser[idx].editing_url = true;
 	}
 }
 
@@ -512,6 +727,7 @@ void wm_init(void) {
 	register_app("Palette", 100, 290, 320, 160, paint_palette, GFX_RGB(0xB1, 0x8C, 0xFF));
 	register_interactive_app("Settings", 100, 40, 380, 330, paint_settings, key_settings, GFX_RGB(0x4D, 0xD0, 0xC7));
 	register_interactive_app("Text Editor", 40, 20, 520, 400, paint_texteditor, key_texteditor, COL_ACCENT);
+	register_interactive_app("Browser", 30, 10, 640, 460, paint_browser, key_browser, GFX_RGB(0xFF, 0x8A, 0x3D));
 	register_console_app("Terminal");
 
 	/* Apps are registered so search/the taskbar can find them, but none
@@ -1232,6 +1448,23 @@ void wm_run(void) {
 		draw_network_panel();
 		draw_cursor(mx, my);
 		gfx_flip();
+
+		/* Browser fetches are blocking (DNS + TCP/TLS handshake + HTTP,
+		 * genuinely multi-second over a slow/real connection) and this
+		 * whole WM loop is single-threaded/synchronous, so triggering one
+		 * straight from key_browser() would freeze the UI on the exact
+		 * same frame that was supposed to show "Loading..." - it'd never
+		 * actually reach the screen. Doing it here instead, right after
+		 * the frame with that text has already been flipped, means the
+		 * user really does see "Loading..." for at least one frame before
+		 * the freeze. */
+		for (int i = 0; i < MAX_WINDOWS; i++) {
+			if (windows[i].used && browser[i].pending_load) {
+				browser[i].pending_load = false;
+				browser_load(&windows[i]);
+				browser[i].loading = false;
+			}
+		}
 
 		timer_wait(1);
 

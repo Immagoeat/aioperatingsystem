@@ -131,6 +131,27 @@ static void bn_mulmod(struct bignum *out, const struct bignum *a, const struct b
 	*out = result;
 }
 
+/* Index (0-based) of the highest set bit in `a`, or -1 if `a` is zero.
+ * Used to bound bn_modexp()'s loop to the exponent's actual bit
+ * length instead of always walking the full BIGNUM_WORDS capacity -
+ * RSA public-key encryption uses a small exponent (65537 = 17 bits)
+ * against a fixed-capacity type sized for a 4096-bit modulus, so
+ * without this bound the loop would run 4096 squarings to do work
+ * that only needs about 17 (each bn_mulmod() call is itself O(bits)
+ * additions of O(BIGNUM_WORDS) words, so this bound is the difference
+ * between a real-time handshake and one that visibly stalls). */
+static int bn_bit_length(const struct bignum *a) {
+	for (int word = BIGNUM_WORDS - 1; word >= 0; word--) {
+		uint32_t w = a->word[word];
+		if (w != 0) {
+			int bit = 31;
+			while (!(w & (1u << bit))) bit--;
+			return word * 32 + bit;
+		}
+	}
+	return -1;
+}
+
 /* out = (base^exp) mod m - square-and-multiply, the standard modular
  * exponentiation algorithm. This is the one operation rsa.c actually
  * needs: RSA public-key encryption is exactly this with exp = the
@@ -144,14 +165,13 @@ static void bn_modexp(struct bignum *out, const struct bignum *base, const struc
 	/* reduce base mod m first, in case it's already >= m */
 	while (bn_cmp(&b, m) >= 0) bn_sub(&b, &b, m);
 
-	for (int word = 0; word < BIGNUM_WORDS; word++) {
-		uint32_t e_word = exp->word[word];
-		for (int bit = 0; bit < 32; bit++) {
-			if (e_word & (1u << bit)) {
-				bn_mulmod(&result, &result, &b, m);
-			}
-			bn_mulmod(&b, &b, &b, m);
+	int top_bit = bn_bit_length(exp);
+	for (int i = 0; i <= top_bit; i++) {
+		int word = i / 32, bit = i % 32;
+		if (exp->word[word] & (1u << bit)) {
+			bn_mulmod(&result, &result, &b, m);
 		}
+		if (i < top_bit) bn_mulmod(&b, &b, &b, m); /* skip the last, unused squaring of b */
 	}
 
 	*out = result;

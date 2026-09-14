@@ -270,6 +270,84 @@ static void cmd_resolve(char *rest) {
 	console_set_color(console_color_default());
 }
 
+/* --- fetch: exercises the full browser pipeline (DNS -> HTTP/HTTPS ->
+ * HTML layout, exactly what wm.c's Browser app does) from the console,
+ * printing the rendered lines as text instead of drawing a window.
+ * Mainly a debugging tool for testing that pipeline without the GUI. */
+#define FETCH_BODY_MAX (64 * 1024)
+static uint8_t fetch_body[FETCH_BODY_MAX];
+
+static void cmd_fetch(char *rest) {
+	char *saveptr;
+	char *scheme = strtok_simple(rest, ' ', &saveptr);
+	char *host = scheme ? strtok_simple(NULL, ' ', &saveptr) : NULL;
+	char *port_str = host ? strtok_simple(NULL, ' ', &saveptr) : NULL;
+	char *path = port_str ? strtok_simple(NULL, ' ', &saveptr) : NULL;
+
+	if (!scheme || !host || !port_str || !path || (strcmp(scheme, "http") != 0 && strcmp(scheme, "https") != 0)) {
+		console_writestring("usage: fetch http|https HOSTNAME PORT PATH\n");
+		console_writestring("  example: fetch https example.com 443 /\n");
+		return;
+	}
+
+	uint32_t port = 0;
+	for (const char *p = port_str; *p; p++) {
+		if (*p < '0' || *p > '9') { console_writestring("Invalid port.\n"); return; }
+		port = port * 10 + (uint32_t)(*p - '0');
+	}
+	if (port == 0 || port > 65535) { console_writestring("Invalid port.\n"); return; }
+
+	kprintf("Resolving %s ...\n", host);
+	console_present();
+
+	uint32_t ip = 0;
+	char error[96];
+	if (!net_resolve_hostname(host, &ip, error, sizeof(error))) {
+		console_writestring("Resolve failed: "); console_writestring(error); console_putchar('\n');
+		return;
+	}
+	const uint8_t *ip_bytes = (const uint8_t *)&ip;
+	kprintf("%s -> %u.%u.%u.%u\n", host, ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3]);
+
+	char ip_str[16];
+	{
+		int pos = 0;
+		for (int i = 0; i < 4; i++) {
+			uint8_t v = ip_bytes[i];
+			if (v >= 100) ip_str[pos++] = (char)('0' + v / 100);
+			if (v >= 10) ip_str[pos++] = (char)('0' + (v / 10) % 10);
+			ip_str[pos++] = (char)('0' + v % 10);
+			if (i < 3) ip_str[pos++] = '.';
+		}
+		ip_str[pos] = '\0';
+	}
+
+	kprintf("Fetching %s://%s:%u%s ...\n", scheme, host, port, path);
+	console_present();
+
+	uint32_t body_len = 0;
+	bool ok = (strcmp(scheme, "https") == 0)
+		? net_https_get(ip, host, (uint16_t)port, path, fetch_body, sizeof(fetch_body), &body_len, error, sizeof(error))
+		: net_http_get(ip_str, (uint16_t)port, path, fetch_body, sizeof(fetch_body), &body_len, error, sizeof(error));
+
+	if (!ok) {
+		console_writestring("Fetch failed: "); console_writestring(error); console_putchar('\n');
+		return;
+	}
+
+	kprintf("Got %u bytes. Rendered:\n", body_len);
+	console_writestring("--------------------------------------------------\n");
+
+	static struct html_page page;
+	html_layout(fetch_body, body_len, &page, 78);
+	if (page.title[0]) { kprintf("Title: %s\n\n", page.title); }
+	for (int i = 0; i < page.line_count; i++) {
+		console_writestring(page.lines[i]);
+		console_putchar('\n');
+	}
+	console_writestring("--------------------------------------------------\n");
+}
+
 /* --- download: a real HTTP GET over the TCP/IP stack in net.c, saved
  * to the current directory. No DNS (see net.c's file comment), so the
  * host must be given as a literal IPv4 address, and no URL parser
@@ -514,6 +592,7 @@ bool terminal_dispatch(const char *cmd, char *rest) {
 	else if (strcmp(cmd, "update") == 0) { updatecmd_run(); }
 	else if (strcmp(cmd, "netconnect") == 0) { cmd_netconnect(); }
 	else if (strcmp(cmd, "resolve") == 0) { cmd_resolve(rest); }
+	else if (strcmp(cmd, "fetch") == 0) { cmd_fetch(rest); }
 	else if (strcmp(cmd, "download") == 0) { cmd_download(rest); }
 	else return false;
 	return true;
