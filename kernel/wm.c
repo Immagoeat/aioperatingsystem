@@ -31,12 +31,20 @@
 
 struct window;
 typedef void (*window_paint_fn)(struct window *w);
+/* Per-window keyboard input, for apps that need more than a click (the
+ * Settings picker's arrow keys, the Text Editor's actual typing). Only
+ * the topmost non-minimized window ever receives keys this way - see
+ * wm_run()'s input dispatch - and only apps that register one of these
+ * (via register_interactive_app()) get keyboard focus at all; plain
+ * paint-only apps like Palette are never sent keys. */
+typedef void (*window_key_fn)(struct window *w, char c);
 
 struct window {
 	bool used;
 	int x, y, w, h;
 	char title[32];
 	window_paint_fn paint;
+	window_key_fn key; /* NULL for apps with no keyboard interaction */
 	int counter;
 	gfx_color_t accent;
 
@@ -162,7 +170,215 @@ static void paint_palette(struct window *w) {
 	}
 }
 
-static int create_window(int x, int y, int w, int h, const char *title, window_paint_fn paint, gfx_color_t accent) {
+/* --- Settings: a real window, like Palette, rather than a console
+ * takeover - see settings.c for the timezone data/logic this draws.
+ * Per-window state (which slot in the timezone list is highlighted),
+ * indexed by window slot since only one Settings window can exist at
+ * a time (same one-per-name rule every app here follows). */
+static int settings_selected[MAX_WINDOWS];
+static bool settings_applied[MAX_WINDOWS]; /* true once Enter has been pressed this session, to show a confirmation */
+
+static void paint_settings(struct window *w) {
+	int idx = (int)(w - windows);
+	int x = w->x + PADDING, y = w->y + TITLEBAR_H + PADDING;
+	int lh = gfx_char_height() + 4;
+
+	gfx_draw_string(x, y, "Timezone", w->accent); y += lh + 6;
+	gfx_draw_string(x, y, "auroraOS can't detect your region (no", COL_TEXT_DIM); y += lh;
+	gfx_draw_string(x, y, "network/GPS) - it assumes the clock is", COL_TEXT_DIM); y += lh;
+	gfx_draw_string(x, y, "already local time. Pick a UTC offset:", COL_TEXT_DIM); y += lh + 10;
+
+	int list_top = y;
+	int row_h = lh + 4;
+	int max_visible = (w->h + TITLEBAR_H - (list_top - w->y) - PADDING - 28) / row_h;
+	if (max_visible < 1) max_visible = 1;
+
+	int count = timezone_option_count();
+	int selected = settings_selected[idx];
+	int visible_start = selected - max_visible / 2;
+	if (visible_start < 0) visible_start = 0;
+	if (visible_start > count - max_visible) visible_start = count - max_visible;
+	if (visible_start < 0) visible_start = 0;
+	int visible_end = visible_start + max_visible;
+	if (visible_end > count) visible_end = count;
+
+	for (int i = visible_start; i < visible_end; i++) {
+		const struct timezone_option *opt = timezone_option_get(i);
+		bool is_selected = (i == selected);
+		if (is_selected) {
+			gfx_fill_round_rect(x - 4, y - 2, w->w - 2 * PADDING + 8, row_h - 2, 5, COL_TASKBAR_ACTIVE);
+		}
+		gfx_draw_string(x, y, opt->label, is_selected ? COL_TEXT : COL_TEXT_DIM);
+		y += row_h;
+	}
+
+	int footer_y = w->y + w->h + TITLEBAR_H - 24;
+	if (settings_applied[idx]) {
+		gfx_draw_string(x, footer_y, "Timezone updated.", GFX_RGB(0x28, 0xC8, 0x40));
+	} else {
+		gfx_draw_string(x, footer_y, "Arrows move, Enter applies", COL_TEXT_DIM);
+	}
+}
+
+static void key_settings(struct window *w, char c) {
+	int idx = (int)(w - windows);
+	int count = timezone_option_count();
+
+	if (c == KEY_ARROW_UP) {
+		if (settings_selected[idx] > 0) settings_selected[idx]--;
+		settings_applied[idx] = false;
+	} else if (c == KEY_ARROW_DOWN) {
+		if (settings_selected[idx] < count - 1) settings_selected[idx]++;
+		settings_applied[idx] = false;
+	} else if (c == '\n') {
+		const struct timezone_option *opt = timezone_option_get(settings_selected[idx]);
+		if (opt) {
+			rtc_set_timezone_offset_minutes(opt->offset_minutes);
+			settings_applied[idx] = true;
+		}
+	}
+}
+
+/* --- Text Editor: a real window, like Palette, rather than a console
+ * takeover. The actual editing logic (insert/delete/move/split) lives
+ * in noteedit.c, shared with the full-screen console `nano` command -
+ * this only draws it with gfx_* calls instead of console_* ones, and
+ * adds the one thing a window needs that the console version didn't:
+ * its own filename entry field, since there's no console to borrow
+ * for that prompt anymore. Per-window state, indexed by window slot
+ * (only one Text Editor window can exist at a time, same one-per-name
+ * rule every app here follows). */
+#define TEXTEDITOR_FILENAME_MAX 32
+struct texteditor_state {
+	bool picking_filename; /* true = showing the filename field; false = editing */
+	char filename[TEXTEDITOR_FILENAME_MAX];
+	int filename_len;
+	struct note_buffer nb;
+	bool loaded; /* true once note_load() has actually run for `filename` */
+};
+static struct texteditor_state texteditor[MAX_WINDOWS];
+
+static void paint_texteditor(struct window *w) {
+	int idx = (int)(w - windows);
+	struct texteditor_state *st = &texteditor[idx];
+	int x = w->x + PADDING, y = w->y + TITLEBAR_H + PADDING;
+	int lh = gfx_char_height() + 4;
+
+	if (st->picking_filename) {
+		gfx_draw_string(x, y, "Text Editor", w->accent); y += lh + 10;
+		gfx_draw_string(x, y, "File to open (created if it doesn't", COL_TEXT_DIM); y += lh;
+		gfx_draw_string(x, y, "exist), then press Enter:", COL_TEXT_DIM); y += lh + 10;
+
+		int field_w = w->w - 2 * PADDING;
+		int field_h = 32;
+		gfx_fill_round_rect(x, y, field_w, field_h, 6, COL_WIN_BODY_ALT);
+		gfx_draw_string(x + 10, y + (field_h - gfx_char_height()) / 2, st->filename, COL_TEXT);
+		if (((timer_get_ticks() / 30) % 2) == 0) {
+			int cursor_x = x + 10 + gfx_string_width(st->filename);
+			gfx_fill_rect(cursor_x + 2, y + 6, 2, field_h - 12, w->accent);
+		}
+		return;
+	}
+
+	/* editing mode: header line, then a status line, then the
+	 * line-numbered text - matching the console version's information
+	 * but on two lines instead of one, so a long filename can never
+	 * collide with the "Ln/Col" readout the way sharing one line risked. */
+	char header[96];
+	strcpy(header, st->filename);
+	if (st->nb.dirty) strcat(header, " [modified]");
+	gfx_draw_string(x, y, header, w->accent);
+	y += lh + 2;
+
+	char pos[48];
+	pos[0] = '\0';
+	{
+		/* "Ln %d, Col %d" without kprintf (console-only) - build it by
+		 * hand the same way wm.c's network panel formats numbers */
+		char numbuf[12];
+		int n, i;
+		strcat(pos, "Ln ");
+		n = st->nb.cur_line + 1; i = 11; numbuf[i] = '\0';
+		if (n == 0) numbuf[--i] = '0';
+		while (n > 0) { numbuf[--i] = (char)('0' + n % 10); n /= 10; }
+		strcat(pos, &numbuf[i]);
+		strcat(pos, ", Col ");
+		n = st->nb.cur_col + 1; i = 11; numbuf[i] = '\0';
+		if (n == 0) numbuf[--i] = '0';
+		while (n > 0) { numbuf[--i] = (char)('0' + n % 10); n /= 10; }
+		strcat(pos, &numbuf[i]);
+	}
+	gfx_draw_string(x, y, pos, COL_TEXT_DIM);
+	y += lh + 8;
+	int text_area_top = y; /* first text row's y - used below for the cursor's y math too, so it can't drift out of sync with the header layout above */
+
+	int gutter_digits = note_line_number_digits(&st->nb);
+	int char_w = gfx_char_width();
+	int gutter_px = (gutter_digits + 3) * char_w;
+
+	int row_h = lh;
+	int max_visible = (w->h + TITLEBAR_H - (y - w->y) - PADDING) / row_h;
+	if (max_visible < 1) max_visible = 1;
+
+	int visible_start = 0;
+	if (st->nb.cur_line >= visible_start + max_visible) visible_start = st->nb.cur_line - max_visible + 1;
+	if (st->nb.cur_line < visible_start) visible_start = st->nb.cur_line;
+	if (st->nb.line_count > max_visible && visible_start > st->nb.line_count - max_visible) {
+		visible_start = st->nb.line_count - max_visible;
+	}
+	if (visible_start < 0) visible_start = 0;
+
+	for (int i = visible_start; i < st->nb.line_count && i < visible_start + max_visible; i++) {
+		char numbuf[16];
+		int n = i + 1, p = 15;
+		numbuf[p] = '\0';
+		while (n > 0) { numbuf[--p] = (char)('0' + n % 10); n /= 10; }
+		int num_w = gfx_string_width(&numbuf[p]);
+		gfx_draw_string(x + gutter_px - char_w * 3 - num_w, y, &numbuf[p], COL_TEXT_DIM);
+		gfx_draw_string(x + gutter_px - char_w * 2, y, "|", COL_TEXT_DIM);
+		gfx_draw_string(x + gutter_px, y, st->nb.lines[i], COL_TEXT);
+		y += row_h;
+	}
+
+	/* blinking text-entry cursor at the real (cur_line, cur_col)
+	 * position, the windowed equivalent of console_set_cursor() */
+	if (((timer_get_ticks() / 30) % 2) == 0) {
+		int cursor_row = st->nb.cur_line - visible_start;
+		if (cursor_row >= 0 && cursor_row < max_visible) {
+			int cx = x + gutter_px + st->nb.cur_col * char_w;
+			int cy = text_area_top + cursor_row * row_h;
+			gfx_fill_rect(cx, cy, 2, gfx_char_height(), w->accent);
+		}
+	}
+}
+
+static void key_texteditor(struct window *w, char c) {
+	int idx = (int)(w - windows);
+	struct texteditor_state *st = &texteditor[idx];
+
+	if (st->picking_filename) {
+		if (c == '\n') {
+			if (st->filename_len == 0) return;
+			note_load(&st->nb, FAT16_ROOT_CLUSTER, st->filename);
+			st->loaded = true;
+			st->picking_filename = false;
+		} else if (c == '\b') {
+			if (st->filename_len > 0) st->filename[--st->filename_len] = '\0';
+		} else if (c >= 32 && c < 127 && st->filename_len < TEXTEDITOR_FILENAME_MAX - 1) {
+			st->filename[st->filename_len++] = c;
+			st->filename[st->filename_len] = '\0';
+		}
+		return;
+	}
+
+	if (c == CTRL_KEY('s')) {
+		note_save(&st->nb, FAT16_ROOT_CLUSTER, st->filename);
+	} else {
+		note_handle_key(&st->nb, c);
+	}
+}
+
+static int create_window(int x, int y, int w, int h, const char *title, window_paint_fn paint, window_key_fn key, gfx_color_t accent) {
 	for (int i = 0; i < MAX_WINDOWS; i++) {
 		if (!windows[i].used) {
 			windows[i].used = true;
@@ -171,6 +387,7 @@ static int create_window(int x, int y, int w, int h, const char *title, window_p
 			windows[i].w = w;
 			windows[i].h = h;
 			windows[i].paint = paint;
+			windows[i].key = key;
 			windows[i].counter = 0;
 			windows[i].accent = accent;
 			windows[i].minimized = false;
@@ -191,12 +408,13 @@ struct app_entry {
 	const char *name;
 	int x_offset, y_offset, w, h;
 	window_paint_fn paint;
+	window_key_fn key; /* NULL for apps with no keyboard interaction (About, Uptime, Palette) */
 	gfx_color_t accent;
-	/* Console apps (nano) aren't drawn as a window at all - they take
-	 * over the whole screen via the software console the same way the
-	 * shell does, so launching one suspends the WM loop entirely rather
-	 * than creating a struct window. `paint`/geometry are unused (and
-	 * left zeroed) for these. */
+	/* Console apps (Terminal) aren't drawn as a window at all - they
+	 * take over the whole screen via the software console the same way
+	 * the shell does, so launching one suspends the WM loop entirely
+	 * rather than creating a struct window. `paint`/`key`/geometry are
+	 * unused (and left zeroed) for these. */
 	bool is_console_app;
 };
 
@@ -207,12 +425,17 @@ static int base_cx, base_cy;
 
 static void register_app(const char *name, int x_offset, int y_offset, int w, int h, window_paint_fn paint, gfx_color_t accent) {
 	if (app_count >= MAX_APPS) return;
-	apps[app_count++] = (struct app_entry){ name, x_offset, y_offset, w, h, paint, accent, false };
+	apps[app_count++] = (struct app_entry){ name, x_offset, y_offset, w, h, paint, NULL, accent, false };
+}
+
+static void register_interactive_app(const char *name, int x_offset, int y_offset, int w, int h, window_paint_fn paint, window_key_fn key, gfx_color_t accent) {
+	if (app_count >= MAX_APPS) return;
+	apps[app_count++] = (struct app_entry){ name, x_offset, y_offset, w, h, paint, key, accent, false };
 }
 
 static void register_console_app(const char *name) {
 	if (app_count >= MAX_APPS) return;
-	apps[app_count++] = (struct app_entry){ name, 0, 0, 0, 0, NULL, 0, true };
+	apps[app_count++] = (struct app_entry){ name, 0, 0, 0, 0, NULL, NULL, 0, true };
 }
 
 static int find_open_window_by_name(const char *name) {
@@ -233,24 +456,36 @@ static void run_console_app(void (*entry)(void)) {
 	while (keyboard_has_key()) keyboard_getchar_blocking();
 }
 
+/* Called exactly once, right after a fresh window is created, so apps
+ * with real state (Settings' selected timezone, Text Editor's buffer)
+ * start from a clean slate rather than whatever was left over in their
+ * static per-slot arrays from a previous window that used the same
+ * slot index. */
+static void window_opened(int idx, const char *app_name) {
+	if (strcmp(app_name, "Settings") == 0) {
+		settings_selected[idx] = timezone_find_closest_option(rtc_get_timezone_offset_minutes());
+		settings_applied[idx] = false;
+	} else if (strcmp(app_name, "Text Editor") == 0) {
+		memset(&texteditor[idx], 0, sizeof(texteditor[idx]));
+		texteditor[idx].picking_filename = true;
+	}
+}
+
 static void launch_or_focus_app(int app_index) {
 	if (app_index < 0 || app_index >= app_count) return;
 	struct app_entry *app = &apps[app_index];
 
 	if (app->is_console_app) {
-		if (strcmp(app->name, "Text Editor") == 0) {
-			run_console_app(terminal_launch_nano_from_gui);
-		} else if (strcmp(app->name, "Terminal") == 0) {
+		if (strcmp(app->name, "Terminal") == 0) {
 			run_console_app(terminal_app_run);
-		} else if (strcmp(app->name, "Settings") == 0) {
-			run_console_app(settings_app_run);
 		}
 		return;
 	}
 
 	int idx = find_open_window_by_name(app->name);
 	if (idx < 0) {
-		idx = create_window(base_cx + app->x_offset, base_cy + app->y_offset, app->w, app->h, app->name, app->paint, app->accent);
+		idx = create_window(base_cx + app->x_offset, base_cy + app->y_offset, app->w, app->h, app->name, app->paint, app->key, app->accent);
+		if (idx >= 0) window_opened(idx, app->name); /* let a freshly created window initialize its own per-window state */
 	}
 	if (idx >= 0) {
 		windows[idx].minimized = false;
@@ -275,9 +510,9 @@ void wm_init(void) {
 	register_app("About auroraOS", 0, 0, 500, 320, paint_about, COL_ACCENT);
 	register_app("Uptime", 540, 0, 280, 190, paint_counter, GFX_RGB(0x28, 0xC8, 0x40));
 	register_app("Palette", 100, 290, 320, 160, paint_palette, GFX_RGB(0xB1, 0x8C, 0xFF));
-	register_console_app("Text Editor");
+	register_interactive_app("Settings", 100, 40, 380, 330, paint_settings, key_settings, GFX_RGB(0x4D, 0xD0, 0xC7));
+	register_interactive_app("Text Editor", 40, 20, 520, 400, paint_texteditor, key_texteditor, COL_ACCENT);
 	register_console_app("Terminal");
-	register_console_app("Settings");
 
 	/* Apps are registered so search/the taskbar can find them, but none
 	 * are opened automatically - the desktop boots to an empty screen,
@@ -1031,6 +1266,15 @@ void wm_run(void) {
 				cycle_wallpaper();
 			} else if (c == '/') {
 				open_search();
+			} else if (topmost_visible >= 0 && windows[topmost_visible].key) {
+				/* Global shortcuts above always win even while a window
+				 * has focus (Ctrl+Q must never feel "stuck" behind
+				 * whatever's being edited) - only once none of them
+				 * match does the topmost window get a chance to handle
+				 * the key itself (Settings' arrows, Text Editor's
+				 * typing). Only apps that registered a key handler via
+				 * register_interactive_app() ever receive one. */
+				windows[topmost_visible].key(&windows[topmost_visible], c);
 			}
 		}
 	}

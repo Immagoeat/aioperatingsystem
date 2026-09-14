@@ -230,78 +230,11 @@ static void cmd_netconnect(void) {
 
 /* --- nano: a small full-screen text editor ---
  *
- * Deliberately simple, but supports real cursor movement: arrow keys
- * reposition within and across lines, Enter splits the current line at
- * the cursor, Backspace deletes the character before the cursor
- * (merging with the previous line at column 0), and typed characters
- * insert at the cursor rather than only appending at end-of-line.
- * Ctrl+S saves, Ctrl+X exits (prompting to save first if there are
- * unsaved changes). Good enough to write and revise a short assembly
- * program, which is its main purpose here. */
-#define NANO_MAX_LINES 200
-#define NANO_MAX_LINE_LEN 100
-
-struct nano_buffer {
-	char lines[NANO_MAX_LINES][NANO_MAX_LINE_LEN];
-	int line_count;
-	int cur_line;
-	int cur_col;
-	bool dirty;
-};
-
-static void nano_load(struct nano_buffer *nb, const char *filename) {
-	memset(nb, 0, sizeof(*nb));
-	nb->line_count = 1;
-
-	struct fat16_entry entry;
-	if (!fat16_stat(cwd_cluster, filename, &entry) || entry.is_dir) return;
-
-	static char filebuf[32768];
-	uint32_t to_read = entry.size < sizeof(filebuf) - 1 ? entry.size : sizeof(filebuf) - 1;
-	uint32_t got = fat16_read_file(entry.first_cluster, entry.size, 0, filebuf, to_read);
-	filebuf[got] = '\0';
-
-	int line = 0, col = 0;
-	for (uint32_t i = 0; i < got && line < NANO_MAX_LINES; i++) {
-		if (filebuf[i] == '\n') {
-			nb->lines[line][col] = '\0';
-			line++;
-			col = 0;
-		} else if (col < NANO_MAX_LINE_LEN - 1) {
-			nb->lines[line][col++] = filebuf[i];
-		}
-	}
-	nb->lines[line][col] = '\0';
-	nb->line_count = line + 1;
-	nb->cur_line = line;
-	nb->cur_col = col;
-}
-
-static bool nano_save(struct nano_buffer *nb, const char *filename) {
-	static char out[32768];
-	uint32_t pos = 0;
-	for (int i = 0; i < nb->line_count && pos < sizeof(out) - 2; i++) {
-		size_t len = strlen(nb->lines[i]);
-		if (pos + len >= sizeof(out) - 2) len = sizeof(out) - 2 - pos;
-		memcpy(out + pos, nb->lines[i], len);
-		pos += (uint32_t)len;
-		if (i < nb->line_count - 1) out[pos++] = '\n';
-	}
-	bool ok = fat16_write_file(cwd_cluster, filename, out, pos);
-	if (ok) nb->dirty = false;
-	return ok;
-}
-
+ * Console rendering only - the actual editing logic (cursor movement,
+ * insert/delete, line splitting) lives in noteedit.c, shared with the
+ * windowed "Text Editor" GUI app in wm.c. Ctrl+S saves, Ctrl+X exits
+ * (prompting to save first if there are unsaved changes). */
 #define NANO_HEADER_ROWS 2 /* title line + blank line, before the text area starts */
-
-/* Width of the "NNN | " line-number gutter, sized to the line count so
- * numbers stay right-aligned and the "| " separator lines up even once
- * the file grows past 9/99/999 lines. */
-static int nano_line_number_digits(const struct nano_buffer *nb) {
-	int digits = 1;
-	for (int n = nb->line_count; n >= 10; n /= 10) digits++;
-	return digits;
-}
 
 /* kprintf has no field-width support (see printf.c), so right-align the
  * line number by hand: pad with spaces, then print the number itself. */
@@ -312,7 +245,7 @@ static void nano_print_line_number(int number, int digits) {
 	kprintf("%d | ", number);
 }
 
-static void nano_redraw(struct nano_buffer *nb, const char *filename) {
+static void nano_redraw(struct note_buffer *nb, const char *filename) {
 	console_clear();
 	console_set_color(console_color_accent());
 	kprintf("-- nano: %s%s -- Ln %d, Col %d / %d lines -- (arrows move, Ctrl+S save, Ctrl+X exit)\n\n",
@@ -331,7 +264,7 @@ static void nano_redraw(struct nano_buffer *nb, const char *filename) {
 	}
 	if (visible_start < 0) visible_start = 0;
 
-	int digits = nano_line_number_digits(nb);
+	int digits = note_line_number_digits(nb);
 	int gutter = digits + 3; /* digits + " | " */
 	for (int i = visible_start; i < nb->line_count; i++) {
 		console_set_color(console_color_dim());
@@ -348,8 +281,8 @@ static void cmd_nano(const char *filename) {
 	if (!fs_ready()) return;
 	if (!filename || filename[0] == '\0') { console_writestring("usage: nano FILENAME\n"); return; }
 
-	static struct nano_buffer nb;
-	nano_load(&nb, filename);
+	static struct note_buffer nb;
+	note_load(&nb, cwd_cluster, filename);
 	nano_redraw(&nb, filename);
 	console_present();
 
@@ -365,7 +298,7 @@ static void cmd_nano(const char *filename) {
 				console_putchar('\n');
 				console_present();
 				if (answer == 'y' || answer == 'Y') {
-					if (!nano_save(&nb, filename)) {
+					if (!note_save(&nb, cwd_cluster, filename)) {
 						console_writestring("Save failed; not exiting.\n");
 						console_present();
 						continue;
@@ -374,166 +307,19 @@ static void cmd_nano(const char *filename) {
 			}
 			break;
 		} else if (c == CTRL_KEY('s')) {
-			if (!nano_save(&nb, filename)) {
+			if (!note_save(&nb, cwd_cluster, filename)) {
 				console_writestring("\nSave failed (disk full or name invalid).\n");
 			}
 			nano_redraw(&nb, filename);
 			console_present();
-		} else if (c == '\n') {
-			/* Split the current line at the cursor: everything before
-			 * cur_col stays on this line, everything from cur_col on
-			 * moves to a new line right after it. */
-			if (nb.line_count < NANO_MAX_LINES) {
-				char *cur = nb.lines[nb.cur_line];
-				for (int i = nb.line_count; i > nb.cur_line + 1; i--) {
-					strcpy(nb.lines[i], nb.lines[i - 1]);
-				}
-				strcpy(nb.lines[nb.cur_line + 1], cur + nb.cur_col);
-				cur[nb.cur_col] = '\0';
-				nb.line_count++;
-				nb.cur_line++;
-				nb.cur_col = 0;
-				nb.dirty = true;
-				nano_redraw(&nb, filename);
-				console_present();
-			}
-		} else if (c == '\b') {
-			if (nb.cur_col > 0) {
-				/* delete the character immediately before the cursor,
-				 * shifting the remainder of the line left */
-				char *line = nb.lines[nb.cur_line];
-				int len = (int)strlen(line);
-				for (int i = nb.cur_col - 1; i < len; i++) {
-					line[i] = line[i + 1];
-				}
-				nb.cur_col--;
-				nb.dirty = true;
-				nano_redraw(&nb, filename);
-				console_present();
-			} else if (nb.cur_line > 0) {
-				/* merge with the previous line if it fits, matching how
-				 * backspace-at-line-start normally behaves */
-				int prev_len = (int)strlen(nb.lines[nb.cur_line - 1]);
-				int this_len = (int)strlen(nb.lines[nb.cur_line]);
-				if (prev_len + this_len < NANO_MAX_LINE_LEN) {
-					strcat(nb.lines[nb.cur_line - 1], nb.lines[nb.cur_line]);
-					for (int i = nb.cur_line; i < nb.line_count - 1; i++) {
-						strcpy(nb.lines[i], nb.lines[i + 1]);
-					}
-					nb.line_count--;
-					nb.cur_line--;
-					nb.cur_col = prev_len;
-					nb.dirty = true;
-					nano_redraw(&nb, filename);
-					console_present();
-				}
-			}
-		} else if (c == KEY_ARROW_LEFT) {
-			if (nb.cur_col > 0) {
-				nb.cur_col--;
-			} else if (nb.cur_line > 0) {
-				nb.cur_line--;
-				nb.cur_col = (int)strlen(nb.lines[nb.cur_line]);
-			}
+		} else if (note_handle_key(&nb, c)) {
 			nano_redraw(&nb, filename);
 			console_present();
-		} else if (c == KEY_ARROW_RIGHT) {
-			int len = (int)strlen(nb.lines[nb.cur_line]);
-			if (nb.cur_col < len) {
-				nb.cur_col++;
-			} else if (nb.cur_line < nb.line_count - 1) {
-				nb.cur_line++;
-				nb.cur_col = 0;
-			}
-			nano_redraw(&nb, filename);
-			console_present();
-		} else if (c == KEY_ARROW_UP) {
-			if (nb.cur_line > 0) {
-				nb.cur_line--;
-				int len = (int)strlen(nb.lines[nb.cur_line]);
-				if (nb.cur_col > len) nb.cur_col = len;
-			}
-			nano_redraw(&nb, filename);
-			console_present();
-		} else if (c == KEY_ARROW_DOWN) {
-			if (nb.cur_line < nb.line_count - 1) {
-				nb.cur_line++;
-				int len = (int)strlen(nb.lines[nb.cur_line]);
-				if (nb.cur_col > len) nb.cur_col = len;
-			}
-			nano_redraw(&nb, filename);
-			console_present();
-		} else if (c >= 32 && c < 127) {
-			char *line = nb.lines[nb.cur_line];
-			int len = (int)strlen(line);
-			if (len < NANO_MAX_LINE_LEN - 1) {
-				/* insert at the cursor, shifting the rest of the line
-				 * right (rather than only ever appending at the end) */
-				for (int i = len; i >= nb.cur_col; i--) {
-					line[i + 1] = line[i];
-				}
-				line[nb.cur_col] = c;
-				nb.cur_col++;
-				nb.dirty = true;
-				nano_redraw(&nb, filename);
-				console_present();
-			}
 		}
 	}
 
 	console_clear();
 	console_writestring("Exited nano.\n");
-}
-
-/* Reads a filename from the console the same simple way shell.c's own
- * read_line() does (printable characters only - arrow keys and Ctrl
- * codes are excluded rather than inserted as garbage). Used by the GUI
- * "Text Editor" app, which has no text-input dialog of its own, so it
- * borrows the console for just this one prompt before nano takes over. */
-static void read_filename(char *buf, size_t max_len) {
-	size_t len = 0;
-	for (;;) {
-		char c = keyboard_getchar_blocking();
-		if (c == '\n') {
-			buf[len] = '\0';
-			console_putchar('\n');
-			console_present();
-			return;
-		} else if (c == '\b') {
-			if (len > 0) { len--; console_putchar('\b'); }
-		} else if (c >= 32 && c < 127 && len < max_len - 1) {
-			buf[len++] = c;
-			console_putchar(c);
-		}
-		console_present();
-	}
-}
-
-/* Entry point for launching nano as a GUI app (see wm.c's "Text Editor"
- * app entry): drops to the console to ask which file to open/create at
- * the filesystem root, then runs the normal nano editor. wm.c is
- * responsible for switching graphics modes before/after calling this,
- * the same way it already does around the shell (Ctrl+Q). */
-void terminal_launch_nano_from_gui(void) {
-	console_clear();
-	if (!fs_ready()) {
-		console_writestring("\nPress any key to return to the desktop...\n");
-		console_present();
-		keyboard_getchar_blocking();
-		return;
-	}
-
-	console_set_color(console_color_accent());
-	console_writestring("auroraOS Text Editor\n");
-	console_set_color(console_color_default());
-	console_writestring("File to open (created if it doesn't exist): ");
-	console_present();
-
-	char filename[MAX_PATH_NAME];
-	read_filename(filename, sizeof(filename));
-	if (filename[0] == '\0') return;
-
-	cmd_nano(filename);
 }
 
 /* --- compile / run --- */

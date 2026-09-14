@@ -44,9 +44,10 @@ modern windowed desktop GUI a `gui` command away.
   macOS-style traffic-light window controls, swappable desktop wallpapers,
   a taskbar with a live wall-clock, a keyboard-navigable app-launcher search
   bar, a few demo apps (About, an animated uptime counter, a color palette
-  viewer), plus a real Text Editor (nano), Terminal (the same shell as the
-  text-mode prompt), and a Settings app (timezone, so far) that all run
-  full-screen over the desktop — see [kernel/wm.c](kernel/wm.c)
+  viewer), a real windowed Text Editor (nano) and Settings app (timezone,
+  so far) with real per-window keyboard focus, and a Terminal (the same
+  shell as the text-mode prompt) that runs full-screen over the desktop
+  — see [kernel/wm.c](kernel/wm.c)
 - Swappable wallpapers baked in at build time from
   [assets/wallpapers/](assets/wallpapers/) — see [kernel/wallpaper.c](kernel/wallpaper.c)
 - A detailed, smooth-edged mouse cursor: a tapered arrow silhouette at
@@ -159,26 +160,40 @@ one there automatically makes it searchable too.
 
 ### Text Editor, Terminal, and Settings
 
-Three of the searchable apps aren't drawn as windows: **Text Editor**,
-**Terminal**, and **Settings** are "console apps" that take over the whole
-screen using the same software console the text-mode shell uses, rather
-than being painted into a window on the desktop. Launching one suspends
-the desktop (the same switch `Ctrl+Q` does), runs full-screen, and
-restores the desktop exactly as it was on exit.
+**Text Editor** and **Settings** are real windows, drawn and interacted
+with exactly like About/Uptime/Palette — draggable, closable, minimizable,
+coexisting with every other open window. wm.c gained real per-window
+keyboard focus for this: a `window_key_fn` alongside each window's paint
+function, and the topmost non-minimized window gets first claim on
+keystrokes (global shortcuts like `Ctrl+Q` always win regardless, so
+exiting to the shell never feels "stuck" behind whatever's focused).
 
-- **Text Editor** prompts for a filename (created if it doesn't exist,
-  relative to the filesystem root) and opens it in the same `nano`-style
-  editor described below.
-- **Terminal** drops into the same shell as the text-mode prompt —
-  identical commands, same real FAT16 filesystem — except `exit` takes
-  its place of `gui` (you're already inside the desktop; `exit` returns to
-  it instead of recursing into another copy of it).
-- **Settings** currently holds one setting: timezone (see below).
+- **Text Editor** opens showing an in-window filename field (type a name,
+  Enter to open/create it at the filesystem root), then switches to the
+  same `nano`-style editor described below, drawn with `gfx_*` calls
+  instead of the console's. The actual editing logic — insert/delete at
+  the cursor, arrow-key movement, line splitting — lives in
+  [kernel/noteedit.c](kernel/noteedit.c), shared with the full-screen
+  console `nano` command so there's exactly one set of editing semantics,
+  not two copies that could quietly drift apart.
+- **Settings** currently holds one setting: timezone (see below) — arrows
+  move the highlighted UTC offset, Enter applies it, right there in the
+  window.
 
-See `run_console_app()` / `is_console_app` in [kernel/wm.c](kernel/wm.c),
-`terminal_launch_nano_from_gui()` / `terminal_app_run()` in
-[kernel/terminal.c](kernel/terminal.c) and
-[kernel/shell.c](kernel/shell.c), and `settings_app_run()` in
+**Terminal** is the one exception, and stays a "console app": launching it
+suspends the desktop (the same switch `Ctrl+Q` does) and runs the actual
+shell full-screen via the software console, since a real shell needs a
+scrolling text stream a fixed-size window can't naturally give it. It
+drops into the same shell as the text-mode prompt — identical commands,
+same real FAT16 filesystem — except `exit` takes the place of `gui`
+(you're already inside the desktop; `exit` returns to it instead of
+recursing into another copy of it).
+
+See `register_interactive_app()` / `window_key_fn` and
+`paint_settings()`/`key_settings()` / `paint_texteditor()`/`key_texteditor()`
+in [kernel/wm.c](kernel/wm.c), the shared editing core in
+[kernel/noteedit.c](kernel/noteedit.c), `terminal_app_run()` in
+[kernel/shell.c](kernel/shell.c), and the timezone data/logic in
 [kernel/settings.c](kernel/settings.c).
 
 ### Timezone

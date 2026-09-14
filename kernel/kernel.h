@@ -230,13 +230,34 @@ void shell_run(void);
  * same as the shell (Ctrl+Q) and Text Editor already do. */
 void terminal_app_run(void);
 
-/* --- settings.c --- */
-/* Launches Settings as a GUI app (see wm.c's "Settings"): currently just
- * a timezone picker (see settings.c's file comment on why "auto-detect"
- * means "assume the RTC is local time" rather than real geolocation).
- * Caller is responsible for switching graphics modes before/after, same
- * as the shell (Ctrl+Q), Text Editor, and Terminal already do. */
-void settings_app_run(void);
+/* --- settings.c: timezone data + logic for the windowed "Settings" app
+ * in wm.c (see settings.c's file comment on why "auto-detect" means
+ * "assume the RTC is local time" rather than real geolocation). --- */
+struct timezone_option {
+	const char *label;
+	int offset_minutes;
+};
+int timezone_option_count(void);
+const struct timezone_option *timezone_option_get(int index); /* NULL if index is out of range */
+int timezone_find_closest_option(int offset_minutes); /* index of the listed option nearest the given offset */
+
+/* --- noteedit.c: the text-buffer editing core shared by both of
+ * nano's renderers - the full-screen console version (terminal.c's
+ * `nano` command) and the windowed version (wm.c's "Text Editor" app).
+ * No rendering calls in here at all - see noteedit.c's file comment. --- */
+#define NOTE_MAX_LINES 200
+#define NOTE_MAX_LINE_LEN 100
+struct note_buffer {
+	char lines[NOTE_MAX_LINES][NOTE_MAX_LINE_LEN];
+	int line_count;
+	int cur_line;
+	int cur_col;
+	bool dirty;
+};
+void note_load(struct note_buffer *nb, uint16_t dir_cluster, const char *filename);
+bool note_save(struct note_buffer *nb, uint16_t dir_cluster, const char *filename);
+int note_line_number_digits(const struct note_buffer *nb);
+bool note_handle_key(struct note_buffer *nb, char c); /* returns true if the buffer changed */
 
 /* --- terminal.c: filesystem-aware commands (ls, cd, touch, rm, cat,
  * mkdir, echo with redirection, nano, compile, run). Returns false if
@@ -244,11 +265,6 @@ void settings_app_run(void);
  * to its own commands / the "unknown command" message. */
 bool terminal_dispatch(const char *cmd, char *rest);
 void terminal_print_cwd_prompt_suffix(void);
-/* Launches nano as a full-screen console app from the GUI (see wm.c's
- * "Text Editor" app): prompts for a filename, then edits it. Caller is
- * responsible for switching graphics modes before/after, same as the
- * shell (Ctrl+Q) already does. */
-void terminal_launch_nano_from_gui(void);
 
 /* --- updatecmd.c: a real (not simulated) update mechanism given the
  * constraint that there's no network stack to fetch updates over - see
