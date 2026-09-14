@@ -96,11 +96,21 @@ bool tls_send(struct tls_ctx *ctx, const uint8_t *data, uint32_t len);
 bool tls_recv(struct tls_ctx *ctx, uint8_t *out, uint32_t max_len, uint32_t *out_len); /* one TLS application-data record per call */
 void tls_close(struct tls_ctx *ctx);
 
-/* Fetches one resource via plain HTTP GET (no TLS, no DNS - host_ip_str
- * must be a literal dotted IPv4 address; see net.c's file comment) and
- * hands back just the response body, up to max_body_len bytes. Requires
- * an existing DHCP lease (call net_init_and_request_lease() first).
- * Real TCP underneath: three-way handshake, sequence/ack tracking, a
+/* Resolves a hostname to an IPv4 address via a real DNS A-record query
+ * (RFC 1035) - one query, one response, no caching, no retries beyond
+ * a single timeout, no other record types (CNAME chains are skipped
+ * past rather than followed - see net.c's file comment). Uses the
+ * DHCP-provided DNS server (falling back to the gateway if the lease
+ * didn't include one). Requires an existing DHCP lease. */
+bool net_resolve_hostname(const char *hostname, uint32_t *out_ip, char *out_error, uint32_t out_error_len);
+
+/* Fetches one resource via plain HTTP GET. host_ip_str must be a
+ * literal dotted IPv4 address (resolve a hostname with
+ * net_resolve_hostname() first, then format it back to a string, if
+ * starting from a hostname) - see net.c's file comment. Hands back
+ * just the response body, up to max_body_len bytes. Requires an
+ * existing DHCP lease (call net_init_and_request_lease() first). Real
+ * TCP underneath: three-way handshake, sequence/ack tracking, a
  * four-way close - not a loopback/simulated transfer. */
 bool net_http_get(const char *host_ip_str, uint16_t port, const char *path, void *out_body, uint32_t max_body_len, uint32_t *out_body_len, char *out_error, uint32_t out_error_len);
 

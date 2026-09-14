@@ -81,6 +81,14 @@ void console_clear(void) {
 }
 
 void console_putchar(char c) {
+	/* Mirror every character to the Bochs/QEMU debug port (0xE9). This
+	 * kernel has no serial driver and the console is otherwise only a
+	 * graphics framebuffer, so this is the only way to capture boot/
+	 * shell output as plain text (e.g. `qemu ... -debugcon file:out.log
+	 * -debugcon_output`) for scripted testing. Free when not using
+	 * -debugcon: QEMU just discards unmapped port writes. */
+	outb(0xE9, (uint8_t)c);
+
 	int cw = gfx_char_width();
 	int ch = gfx_char_height() + CON_LINE_SPACING;
 

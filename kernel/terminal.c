@@ -235,6 +235,41 @@ static void cmd_netconnect(void) {
 	}
 }
 
+/* --- resolve: a real DNS A-record lookup (net_resolve_hostname() in
+ * net.c) via the DHCP-provided DNS server. Mainly a debugging tool to
+ * prove DNS works independent of download/TLS. */
+static void cmd_resolve(char *rest) {
+	char *saveptr;
+	char *hostname = strtok_simple(rest, ' ', &saveptr);
+	if (!hostname) {
+		console_writestring("usage: resolve HOSTNAME\n");
+		console_writestring("  example: resolve example.com\n");
+		return;
+	}
+
+	kprintf("Resolving %s ...\n", hostname);
+	console_present();
+
+	uint32_t ip = 0;
+	char error[96];
+	bool ok = net_resolve_hostname(hostname, &ip, error, sizeof(error));
+
+	if (!ok) {
+		console_set_color(GFX_RGB(0xFF, 0x6B, 0x6B));
+		console_writestring("Resolve failed: ");
+		console_writestring(error);
+		console_putchar('\n');
+		console_set_color(console_color_default());
+		return;
+	}
+
+	const uint8_t *ip_bytes = (const uint8_t *)&ip;
+	console_set_color(GFX_RGB(0x28, 0xC8, 0x40));
+	kprintf("%s -> %u.%u.%u.%u\n", hostname,
+		ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3]);
+	console_set_color(console_color_default());
+}
+
 /* --- download: a real HTTP GET over the TCP/IP stack in net.c, saved
  * to the current directory. No DNS (see net.c's file comment), so the
  * host must be given as a literal IPv4 address, and no URL parser
@@ -478,6 +513,7 @@ bool terminal_dispatch(const char *cmd, char *rest) {
 	else if (strcmp(cmd, "echo") == 0) { cmd_echo_maybe_redirect(rest); }
 	else if (strcmp(cmd, "update") == 0) { updatecmd_run(); }
 	else if (strcmp(cmd, "netconnect") == 0) { cmd_netconnect(); }
+	else if (strcmp(cmd, "resolve") == 0) { cmd_resolve(rest); }
 	else if (strcmp(cmd, "download") == 0) { cmd_download(rest); }
 	else return false;
 	return true;

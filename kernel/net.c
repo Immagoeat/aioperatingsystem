@@ -32,6 +32,7 @@ static uint8_t my_mac[6];
 static uint32_t my_ip;      /* 0 until a DHCP lease is obtained */
 static uint32_t gateway_ip;
 static uint32_t subnet_mask;
+static uint32_t dns_server_ip;
 static bool have_lease = false;
 
 /* --- Ethernet --- */
@@ -325,6 +326,14 @@ bool net_init_and_request_lease(void) {
 	if (router_opt && opt_len == 4) memcpy(&gateway_ip, router_opt, 4);
 	else gateway_ip = server_ip;
 
+	/* DNS server (option 6) - DHCP servers almost universally hand this
+	 * out (it's one of the most common options after the IP itself),
+	 * but fall back to the gateway if it's somehow missing, since a
+	 * typical home/office router also answers DNS queries itself. */
+	const uint8_t *dns_opt = dhcp_find_option(&ack, 6, &opt_len);
+	if (dns_opt && opt_len >= 4) memcpy(&dns_server_ip, dns_opt, 4);
+	else dns_server_ip = gateway_ip;
+
 	have_lease = true;
 
 	net_status_cache.have_lease = true;
@@ -403,6 +412,169 @@ static bool arp_resolve(uint32_t ip, uint8_t out_mac[6]) {
 static bool resolve_next_hop(uint32_t dest_ip, uint8_t out_mac[6]) {
 	uint32_t next_hop = ((dest_ip ^ my_ip) & subnet_mask) == 0 ? dest_ip : gateway_ip;
 	return arp_resolve(next_hop, out_mac);
+}
+
+/* --- DNS (RFC 1035), just enough for a single A-record (IPv4)
+ * lookup: one query, one response, no caching, no retries beyond a
+ * single timeout, no other record types. This is what turns a
+ * hostname the browser/download commands are given into the literal
+ * IPv4 address every other part of this stack (HTTP, TLS) already
+ * required - net_http_get()/tls_connect() themselves still only ever
+ * take a literal IP, exactly as before; net_resolve_hostname() is the
+ * new piece callers use first if they have a hostname instead. */
+#define DNS_PORT 53
+#define DNS_TYPE_A 1
+#define DNS_CLASS_IN 1
+#define DNS_TIMEOUT_TICKS 300 /* ~3 seconds */
+
+struct dns_header {
+	uint16_t id;
+	uint16_t flags;
+	uint16_t qdcount, ancount, nscount, arcount;
+} __attribute__((packed));
+
+/* Encodes a hostname into DNS's length-prefixed label format
+ * ("www.example.com" -> 3www7example3com0) directly into `out`,
+ * returning the encoded length. */
+static uint32_t dns_encode_name(const char *hostname, uint8_t *out) {
+	uint32_t out_pos = 0;
+	const char *label_start = hostname;
+	for (;;) {
+		const char *p = label_start;
+		while (*p && *p != '.') p++;
+		uint32_t label_len = (uint32_t)(p - label_start);
+		if (label_len > 63) return 0; /* a single label can't exceed 63 bytes per RFC 1035 */
+		out[out_pos++] = (uint8_t)label_len;
+		memcpy(out + out_pos, label_start, label_len);
+		out_pos += label_len;
+		if (*p == '\0') break;
+		label_start = p + 1;
+	}
+	out[out_pos++] = 0x00; /* root label terminator */
+	return out_pos;
+}
+
+/* Skips over one (possibly compressed, per RFC 1035 4.1.4) DNS name at
+ * `pos` within `packet`, returning the position immediately after it.
+ * Needed to walk past the question section and each answer's NAME
+ * field even though this client never needs the name's actual value -
+ * DNS compression means a name can be "any number of labels ending in
+ * either a zero octet or a pointer", and only correctly skipping past
+ * it (rather than assuming a fixed length) keeps the rest of the
+ * packet's offsets valid. */
+static uint32_t dns_skip_name(const uint8_t *packet, uint32_t packet_len, uint32_t pos) {
+	while (pos < packet_len) {
+		uint8_t len_byte = packet[pos];
+		if ((len_byte & 0xC0) == 0xC0) return pos + 2; /* compression pointer: 2 bytes total, doesn't recurse into the pointed-to name for skipping purposes */
+		if (len_byte == 0) return pos + 1; /* root label: end of name */
+		pos += 1 + len_byte;
+	}
+	return pos;
+}
+
+bool net_resolve_hostname(const char *hostname, uint32_t *out_ip, char *out_error, uint32_t out_error_len) {
+	if (!have_lease) {
+		local_strcpy_bounded(out_error, "Not connected (no DHCP lease) - run netconnect first.", out_error_len);
+		return false;
+	}
+
+	uint8_t dns_mac[6];
+	if (!resolve_next_hop(dns_server_ip, dns_mac)) {
+		local_strcpy_bounded(out_error, "Could not resolve the DNS server's MAC address (ARP failed).", out_error_len);
+		return false;
+	}
+
+	uint8_t query[512];
+	struct dns_header *hdr = (struct dns_header *)query;
+	uint16_t query_id = (uint16_t)(timer_get_ticks() & 0xFFFF);
+	hdr->id = htons(query_id);
+	hdr->flags = htons(0x0100); /* recursion desired - ask the server to walk the tree itself, which is what every real resolver (this DNS server) expects a client to request */
+	hdr->qdcount = htons(1);
+	hdr->ancount = 0; hdr->nscount = 0; hdr->arcount = 0;
+
+	uint32_t name_len = dns_encode_name(hostname, query + sizeof(struct dns_header));
+	if (name_len == 0) {
+		local_strcpy_bounded(out_error, "Hostname has a label longer than 63 characters.", out_error_len);
+		return false;
+	}
+	uint32_t p = sizeof(struct dns_header) + name_len;
+	query[p++] = 0x00; query[p++] = DNS_TYPE_A;
+	query[p++] = 0x00; query[p++] = DNS_CLASS_IN;
+
+	uint16_t src_port = (uint16_t)(49152 + (timer_get_ticks() % 16384));
+	if (!send_udp_packet(dns_server_ip, dns_mac, src_port, DNS_PORT, query, (uint16_t)p)) {
+		local_strcpy_bounded(out_error, "Failed to send DNS query.", out_error_len);
+		return false;
+	}
+
+	static uint8_t rx_buf[1600];
+	uint32_t deadline = timer_get_ticks() + DNS_TIMEOUT_TICKS;
+	while (timer_get_ticks() < deadline) {
+		uint16_t len = e1000_poll_receive(rx_buf, sizeof(rx_buf));
+		if (len < sizeof(struct eth_header) + sizeof(struct ipv4_header) + sizeof(struct udp_header)) continue;
+
+		struct eth_header *eth = (struct eth_header *)rx_buf;
+		if (ntohs(eth->ethertype) != ETHERTYPE_IPV4) continue;
+		struct ipv4_header *ip = (struct ipv4_header *)(rx_buf + sizeof(struct eth_header));
+		if (ip->protocol != IP_PROTO_UDP) continue;
+		struct udp_header *udp = (struct udp_header *)((uint8_t *)ip + sizeof(struct ipv4_header));
+		if (ntohs(udp->dest_port) != src_port) continue;
+
+		uint8_t *dns_packet = (uint8_t *)udp + sizeof(struct udp_header);
+		uint32_t dns_offset = (uint32_t)(dns_packet - rx_buf);
+		uint32_t dns_len = len - dns_offset;
+		if (dns_len < sizeof(struct dns_header)) continue;
+
+		struct dns_header *reply_hdr = (struct dns_header *)dns_packet;
+		if (ntohs(reply_hdr->id) != query_id) continue;
+
+		uint16_t flags = ntohs(reply_hdr->flags);
+		if (!(flags & 0x8000)) continue; /* QR bit: must be a response, not a query */
+		uint8_t rcode = (uint8_t)(flags & 0x000F);
+		uint16_t ancount = ntohs(reply_hdr->ancount);
+
+		if (rcode != 0) {
+			/* real, distinct DNS error codes worth telling apart (RFC
+			 * 1035 4.1.1) rather than one generic "failed" message */
+			if (rcode == 3) local_strcpy_bounded(out_error, "DNS: no such domain (NXDOMAIN).", out_error_len);
+			else local_strcpy_bounded(out_error, "DNS query failed (server returned an error).", out_error_len);
+			return false;
+		}
+		if (ancount == 0) {
+			local_strcpy_bounded(out_error, "DNS: no address record found for this hostname.", out_error_len);
+			return false;
+		}
+
+		/* skip the question section (name + 4 bytes of type/class) */
+		uint32_t pos = sizeof(struct dns_header);
+		pos = dns_skip_name(dns_packet, dns_len, pos);
+		pos += 4;
+
+		/* walk the answer records looking for the first A record - a
+		 * real response can mix in other types (e.g. CNAME) that this
+		 * simple client just skips past rather than follows, since
+		 * DNS servers that support recursion (which this client always
+		 * requests) conventionally include the final A record directly
+		 * in the same answer section anyway */
+		for (uint16_t i = 0; i < ancount && pos < dns_len; i++) {
+			pos = dns_skip_name(dns_packet, dns_len, pos);
+			if (pos + 10 > dns_len) break;
+			uint16_t rtype = (uint16_t)((dns_packet[pos] << 8) | dns_packet[pos + 1]);
+			uint16_t rdlength = (uint16_t)((dns_packet[pos + 8] << 8) | dns_packet[pos + 9]);
+			uint32_t rdata_pos = pos + 10;
+			if (rtype == DNS_TYPE_A && rdlength == 4 && rdata_pos + 4 <= dns_len) {
+				memcpy(out_ip, dns_packet + rdata_pos, 4);
+				return true;
+			}
+			pos = rdata_pos + rdlength;
+		}
+
+		local_strcpy_bounded(out_error, "DNS response contained no usable A record.", out_error_len);
+		return false;
+	}
+
+	local_strcpy_bounded(out_error, "DNS query timed out.", out_error_len);
+	return false;
 }
 
 /* --- TCP (RFC 793), just enough for one HTTP/1.0-style request/response:
