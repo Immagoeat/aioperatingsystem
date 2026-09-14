@@ -193,6 +193,25 @@ void timer_install(void);
 uint32_t timer_get_ticks(void);
 void timer_wait(uint32_t ticks);
 
+/* --- sha256.c: a real cryptographic hash (FIPS 180-4), not a rolled-
+ * your-own checksum - see auth.c for what it's used for. --- */
+void sha256(const void *data, uint32_t len, uint8_t out[32]);
+
+/* --- auth.c: a real (salted, hashed - never plaintext) password
+ * gate. Single credential, not multi-account - see auth.c's file
+ * comment for what "user system" honestly means here and its stated
+ * limitations. --- */
+bool auth_is_configured(void); /* true once a password has been set (AURAUSER.DAT exists on disk) */
+bool auth_set_password(const char *password); /* generates a fresh salt, overwrites any existing password */
+bool auth_check_password(const char *password); /* true if it matches the stored salted hash */
+
+/* --- login.c: the console UI for auth.c - first-boot password setup,
+ * and the login prompt on every boot after that. Blocks (loops
+ * forever on a wrong password, after a real if simple slowdown every
+ * few attempts) until the correct password is entered, or returns
+ * immediately if there's no disk to store a password on at all. --- */
+void login_run(void);
+
 /* --- rtc.c --- */
 struct rtc_time {
 	uint8_t hours;   /* 0-23 */

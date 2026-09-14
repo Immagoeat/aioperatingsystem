@@ -80,6 +80,10 @@ void kernel_main(void) {
 	}
 
 	kprintf("[boot] Total memory: %u KB\n", memory_total_kb());
+
+	console_writestring("\n");
+	login_run();
+
 	kprintf("\nauroraOS is ready.\n");
 	console_set_color(console_color_dim());
 	console_writestring("Type 'help' to see available commands. Type 'gui' to start the desktop.\n\n");
