@@ -235,6 +235,70 @@ static void cmd_netconnect(void) {
 	}
 }
 
+/* --- download: a real HTTP GET over the TCP/IP stack in net.c, saved
+ * to the current directory. No DNS (see net.c's file comment), so the
+ * host must be given as a literal IPv4 address, and no URL parser
+ * either - the four pieces (host, port, path, local filename) are
+ * given as separate arguments rather than parsed out of one URL
+ * string, which would be its own surface area (scheme handling,
+ * percent-decoding, etc.) beyond what "prove a real download works"
+ * needs. */
+#define DOWNLOAD_MAX_BODY (48 * 1024)
+static uint8_t download_body[DOWNLOAD_MAX_BODY];
+
+static void cmd_download(char *rest) {
+	if (!fs_ready()) return;
+
+	char *saveptr;
+	char *host = strtok_simple(rest, ' ', &saveptr);
+	char *port_str = host ? strtok_simple(NULL, ' ', &saveptr) : NULL;
+	char *path = port_str ? strtok_simple(NULL, ' ', &saveptr) : NULL;
+	char *out_name = path ? strtok_simple(NULL, ' ', &saveptr) : NULL;
+
+	if (!host || !port_str || !path || !out_name) {
+		console_writestring("usage: download HOST_IP PORT PATH LOCAL_FILENAME\n");
+		console_writestring("  (HOST_IP must be a literal IPv4 address - there's no DNS client)\n");
+		console_writestring("  example: download 93.184.216.34 80 /index.html index.html\n");
+		return;
+	}
+
+	uint32_t port = 0;
+	for (const char *p = port_str; *p; p++) {
+		if (*p < '0' || *p > '9') { console_writestring("Invalid port.\n"); return; }
+		port = port * 10 + (uint32_t)(*p - '0');
+	}
+	if (port == 0 || port > 65535) { console_writestring("Invalid port.\n"); return; }
+
+	kprintf("Downloading http://%s:%u%s ...\n", host, port, path);
+	console_present();
+
+	uint32_t body_len = 0;
+	char error[96];
+	bool ok = net_http_get(host, (uint16_t)port, path, download_body, sizeof(download_body), &body_len, error, sizeof(error));
+
+	if (!ok) {
+		console_set_color(GFX_RGB(0xFF, 0x6B, 0x6B));
+		console_writestring("Download failed: ");
+		console_writestring(error);
+		console_putchar('\n');
+		console_set_color(console_color_default());
+		return;
+	}
+
+	if (!fat16_write_file(cwd_cluster(), out_name, download_body, body_len)) {
+		console_writestring("Downloaded ");
+		kprintf("%u", body_len);
+		console_writestring(" bytes, but could not write ");
+		console_writestring(out_name);
+		console_writestring(" (disk full, or name too long for 8.3).\n");
+		return;
+	}
+
+	console_set_color(GFX_RGB(0x28, 0xC8, 0x40));
+	kprintf("Saved %u bytes to %s\n", body_len, out_name);
+	console_set_color(console_color_default());
+}
+
 /* --- nano: a small full-screen text editor ---
  *
  * Console rendering only - the actual editing logic (cursor movement,
@@ -414,6 +478,7 @@ bool terminal_dispatch(const char *cmd, char *rest) {
 	else if (strcmp(cmd, "echo") == 0) { cmd_echo_maybe_redirect(rest); }
 	else if (strcmp(cmd, "update") == 0) { updatecmd_run(); }
 	else if (strcmp(cmd, "netconnect") == 0) { cmd_netconnect(); }
+	else if (strcmp(cmd, "download") == 0) { cmd_download(rest); }
 	else return false;
 	return true;
 }

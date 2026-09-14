@@ -41,9 +41,9 @@ void e1000_get_mac(uint8_t out[6]);
 bool e1000_send(const void *data, uint16_t len);
 uint16_t e1000_poll_receive(void *out, uint16_t max_len); /* returns 0 if nothing received */
 
-/* --- net.c: just enough of a stack (Ethernet/ARP/IPv4/UDP/DHCP) to get
- * a real DHCP lease over the e1000 driver above - see net.c's file
- * comment for scope. --- */
+/* --- net.c: just enough of a stack (Ethernet/ARP/IPv4/UDP/DHCP/TCP) to
+ * get a real DHCP lease and do a real HTTP download over the e1000
+ * driver above - see net.c's file comment for scope. --- */
 struct net_status {
 	bool have_lease;
 	uint8_t mac[6];
@@ -54,6 +54,14 @@ struct net_status {
 };
 bool net_init_and_request_lease(void); /* brings up the NIC and runs a full DHCP exchange; can block up to ~6 seconds (two DHCP_TIMEOUT_TICKS waits) */
 bool net_get_status(struct net_status *out); /* returns the same as its bool return: whether a lease is currently held */
+
+/* Fetches one resource via plain HTTP GET (no TLS, no DNS - host_ip_str
+ * must be a literal dotted IPv4 address; see net.c's file comment) and
+ * hands back just the response body, up to max_body_len bytes. Requires
+ * an existing DHCP lease (call net_init_and_request_lease() first).
+ * Real TCP underneath: three-way handshake, sequence/ack tracking, a
+ * four-way close - not a loopback/simulated transfer. */
+bool net_http_get(const char *host_ip_str, uint16_t port, const char *path, void *out_body, uint32_t max_body_len, uint32_t *out_body_len, char *out_error, uint32_t out_error_len);
 
 /* --- netinfo.c: honest network hardware status for the GUI's network
  * panel: what's actually attached (via pci.c), and whether there's a

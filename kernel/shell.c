@@ -72,6 +72,7 @@ static void cmd_help(bool from_gui) {
 	console_writestring("  update                - validate + install a staged kernel update\n");
 	console_writestring("\nNetwork (wired only - see README):\n");
 	console_writestring("  netconnect            - request a real DHCP lease over the NIC\n");
+	console_writestring("  download IP PORT PATH FILE - real HTTP GET (no DNS/TLS) to a file\n");
 }
 
 static void cmd_about(void) {
