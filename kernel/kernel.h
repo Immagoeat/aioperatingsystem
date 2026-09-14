@@ -55,6 +55,47 @@ struct net_status {
 bool net_init_and_request_lease(void); /* brings up the NIC and runs a full DHCP exchange; can block up to ~6 seconds (two DHCP_TIMEOUT_TICKS waits) */
 bool net_get_status(struct net_status *out); /* returns the same as its bool return: whether a lease is currently held */
 
+/* A real (if minimal) TCP connection - see net.c's own file comment on
+ * scope (no retransmission/reordering, one connection at a time).
+ * Exposed here (rather than kept static in net.c) so tls.c can drive
+ * TCP directly underneath the TLS record layer, the same way
+ * net_http_get() drives it directly underneath plain HTTP. */
+struct tcp_conn {
+	uint32_t remote_ip;
+	uint8_t remote_mac[6];
+	uint16_t local_port, remote_port;
+	uint32_t local_seq;  /* next byte we'll send */
+	uint32_t remote_seq; /* next byte we expect from them */
+};
+#define TCP_FLAG_FIN 0x01
+#define TCP_FLAG_SYN 0x02
+#define TCP_FLAG_RST 0x04
+#define TCP_FLAG_PSH 0x08
+#define TCP_FLAG_ACK 0x10
+bool tcp_connect(struct tcp_conn *conn, uint32_t remote_ip, uint16_t remote_port);
+bool tcp_send_segment(struct tcp_conn *conn, uint8_t flags, const void *data, uint16_t data_len);
+bool tcp_wait_segment(struct tcp_conn *conn, uint8_t *out_flags, uint8_t *out_data, uint16_t *out_data_len, uint16_t max_data);
+void tcp_close(struct tcp_conn *conn);
+
+/* --- tls.c: a real TLS 1.2 client (TLS_RSA_WITH_AES_128_CBC_SHA256
+ * only - the oldest/simplest real TLS 1.2 mode, chosen because it's
+ * tractable to hand-implement and verify correctly without elliptic-
+ * curve or Galois-field math; many modern servers now refuse this as
+ * too old, so this genuinely only works against servers that still
+ * allow it). Extracts a real RSA key from the server's certificate and
+ * checks the subject name against the hostname, but does NOT validate
+ * the certificate's signature against any trusted root CA (no root
+ * store exists here) - see tls.c's file comment for exactly what real
+ * protection this does and doesn't provide before relying on it for
+ * anything sensitive. --- */
+struct tls_ctx {
+	void *conn; /* opaque - actually a struct tls_conn*, kept private to tls.c */
+};
+bool tls_connect(struct tls_ctx *ctx, uint32_t remote_ip, uint16_t port, const char *hostname, char *out_error, uint32_t out_error_len);
+bool tls_send(struct tls_ctx *ctx, const uint8_t *data, uint32_t len);
+bool tls_recv(struct tls_ctx *ctx, uint8_t *out, uint32_t max_len, uint32_t *out_len); /* one TLS application-data record per call */
+void tls_close(struct tls_ctx *ctx);
+
 /* Fetches one resource via plain HTTP GET (no TLS, no DNS - host_ip_str
  * must be a literal dotted IPv4 address; see net.c's file comment) and
  * hands back just the response body, up to max_body_len bytes. Requires
@@ -137,6 +178,7 @@ char *strcpy(char *dst, const char *src);
 char *strcat(char *dst, const char *src);
 void *memset(void *dst, int val, size_t n);
 void *memcpy(void *dst, const void *src, size_t n);
+void *memmove(void *dst, const void *src, size_t n);
 char *strtok_simple(char *str, char delim, char **saveptr);
 
 /* --- printf.c --- */
@@ -192,6 +234,53 @@ void pic_send_eoi(uint8_t irq);
 void timer_install(void);
 uint32_t timer_get_ticks(void);
 void timer_wait(uint32_t ticks);
+
+/* --- bignum.c: arbitrary-precision modular exponentiation, just
+ * enough for RSA public-key encryption (see rsa.c) - not a general
+ * bignum library. Fixed 4096-bit capacity. --- */
+bool bignum_modexp_bytes(const uint8_t *message, uint32_t message_len,
+                          const uint8_t *exponent, uint32_t exponent_len,
+                          const uint8_t *modulus, uint32_t modulus_len,
+                          uint8_t *out, uint32_t out_len);
+
+/* --- x509.c: just enough X.509/ASN.1 DER parsing to pull an RSA
+ * public key and subject common name out of a TLS server's
+ * certificate. Does NOT validate the certificate's signature against
+ * any trusted root CA (there is no root store here) - see x509.c's
+ * file comment for exactly what real protection this does and doesn't
+ * provide. --- */
+struct x509_pubkey {
+	uint8_t modulus[512];
+	uint32_t modulus_len;
+	uint8_t exponent[8];
+	uint32_t exponent_len;
+};
+struct x509_cert {
+	char subject_cn[128];
+	struct x509_pubkey pubkey;
+};
+bool x509_parse_certificate(const uint8_t *der, uint32_t der_len, struct x509_cert *out);
+
+/* --- hmac.c: HMAC-SHA256 (RFC 2104) and the TLS 1.2 PRF (RFC 5246
+ * section 5) built on top of it - key derivation and the record-layer
+ * MAC for tls.c. --- */
+void hmac_sha256(const uint8_t *key, uint32_t key_len, const uint8_t *data, uint32_t data_len, uint8_t out[32]);
+void tls_prf(const uint8_t *secret, uint32_t secret_len, const char *label,
+             const uint8_t *seed, uint32_t seed_len, uint8_t *out, uint32_t out_len);
+
+/* --- aes.c: AES-128 (FIPS 197) in CBC mode, both directions (a TLS
+ * client encrypts outgoing records and decrypts incoming ones). --- */
+void aes128_cbc_encrypt(const uint8_t key[16], const uint8_t iv[16], const uint8_t *plaintext, uint32_t len, uint8_t *out);
+void aes128_cbc_decrypt(const uint8_t key[16], const uint8_t iv[16], const uint8_t *ciphertext, uint32_t len, uint8_t *out);
+
+/* --- rsa.c: RSA public-key encryption with PKCS#1 v1.5 padding
+ * (RFC 8017 7.2.1) - encryption only, no private-key operations (a
+ * TLS client never needs to decrypt/sign with RSA). Used for TLS 1.2's
+ * RSA key-exchange mode. --- */
+bool rsa_encrypt_pkcs1(const uint8_t *modulus, uint32_t modulus_len,
+                        const uint8_t *pub_exponent, uint32_t exponent_len,
+                        const uint8_t *message, uint32_t message_len,
+                        uint8_t *out, uint32_t out_len);
 
 /* --- sha256.c: a real cryptographic hash (FIPS 180-4), not a rolled-
  * your-own checksum - see auth.c for what it's used for. --- */

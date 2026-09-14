@@ -43,6 +43,22 @@ void *memcpy(void *dst, const void *src, size_t n) {
 	return dst;
 }
 
+/* Unlike memcpy, safe when src/dst overlap: copies backward-to-forward
+ * (highest address first) when dst comes after src in memory, so a
+ * byte isn't overwritten before it's been read - the standard
+ * memmove approach. */
+void *memmove(void *dst, const void *src, size_t n) {
+	unsigned char *d = dst;
+	const unsigned char *s = src;
+	if (d < s) {
+		while (n--) *d++ = *s++;
+	} else if (d > s) {
+		d += n; s += n;
+		while (n--) *--d = *--s;
+	}
+	return dst;
+}
+
 char *strtok_simple(char *str, char delim, char **saveptr) {
 	char *start;
 	if (str) start = str;

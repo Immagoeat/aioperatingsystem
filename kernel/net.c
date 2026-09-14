@@ -425,11 +425,8 @@ struct tcp_header {
 	uint16_t urgent_ptr;
 } __attribute__((packed));
 
-#define TCP_FLAG_FIN 0x01
-#define TCP_FLAG_SYN 0x02
-#define TCP_FLAG_RST 0x04
-#define TCP_FLAG_PSH 0x08
-#define TCP_FLAG_ACK 0x10
+/* TCP_FLAG_* are declared in kernel.h alongside struct tcp_conn, which
+ * tls.c also needs direct access to. */
 
 #define IP_PROTO_TCP 6
 
@@ -459,17 +456,11 @@ static uint16_t tcp_checksum(uint32_t src_ip, uint32_t dest_ip, const void *tcp_
 	return (uint16_t)~sum;
 }
 
-struct tcp_conn {
-	uint32_t remote_ip;
-	uint8_t remote_mac[6];
-	uint16_t local_port, remote_port;
-	uint32_t local_seq;  /* next byte we'll send */
-	uint32_t remote_seq; /* next byte we expect from them */
-};
+/* struct tcp_conn is declared in kernel.h. */
 
 #define TCP_SCRATCH_SIZE 1600
 
-static bool tcp_send_segment(struct tcp_conn *conn, uint8_t flags, const void *data, uint16_t data_len) {
+bool tcp_send_segment(struct tcp_conn *conn, uint8_t flags, const void *data, uint16_t data_len) {
 	uint16_t tcp_len = (uint16_t)(sizeof(struct tcp_header) + data_len);
 	if ((uint32_t)sizeof(struct ipv4_header) + tcp_len > TCP_SCRATCH_SIZE - sizeof(struct eth_header)) return false;
 
@@ -512,7 +503,7 @@ static bool tcp_send_segment(struct tcp_conn *conn, uint8_t flags, const void *d
  * don't match the expected sequence number are treated as "keep
  * waiting", which is correct for the simple, low-latency LAN/direct
  * paths this stack is scoped to (see the file comment). */
-static bool tcp_wait_segment(struct tcp_conn *conn, uint8_t *out_flags, uint8_t *out_data, uint16_t *out_data_len, uint16_t max_data) {
+bool tcp_wait_segment(struct tcp_conn *conn, uint8_t *out_flags, uint8_t *out_data, uint16_t *out_data_len, uint16_t max_data) {
 	static uint8_t rx_buf[1600];
 	uint32_t deadline = timer_get_ticks() + TCP_TIMEOUT_TICKS;
 
@@ -552,7 +543,7 @@ static bool tcp_wait_segment(struct tcp_conn *conn, uint8_t *out_flags, uint8_t 
 	return false;
 }
 
-static bool tcp_connect(struct tcp_conn *conn, uint32_t remote_ip, uint16_t remote_port) {
+bool tcp_connect(struct tcp_conn *conn, uint32_t remote_ip, uint16_t remote_port) {
 	if (!resolve_next_hop(remote_ip, conn->remote_mac)) return false;
 
 	conn->remote_ip = remote_ip;
@@ -592,7 +583,7 @@ static bool tcp_connect(struct tcp_conn *conn, uint32_t remote_ip, uint16_t remo
 	return true;
 }
 
-static void tcp_close(struct tcp_conn *conn) {
+void tcp_close(struct tcp_conn *conn) {
 	/* Best-effort: send our FIN and ACK whatever comes back, but don't
 	 * loop indefinitely waiting for the peer's own FIN - the caller
 	 * already has everything it needs (the HTTP response body) by the
