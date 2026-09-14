@@ -92,18 +92,37 @@ modern windowed desktop GUI a `gui` command away.
 - Real PCI configuration-space enumeration ([kernel/pci.c](kernel/pci.c)),
   a real driver for the Intel e1000 Ethernet controller
   ([kernel/e1000.c](kernel/e1000.c): MMIO registers, DMA descriptor rings,
-  polling TX/RX), and just enough of a network stack
-  ([kernel/net.c](kernel/net.c): Ethernet/ARP/IPv4/UDP/DHCP) to request and
-  receive a real DHCP lease — `netconnect` in the shell or "Connect" in the
-  taskbar's network panel. No Wi-Fi (needs per-chipset firmware-dependent
-  drivers and a WPA supplicant — thousands more lines of work), no fake
-  "Connected" state for unsupported hardware — see the Network section below
-- A real (not simulated) update mechanism given the constraint that there's
-  no network stack to fetch updates over: an `update` command
+  polling TX/RX), and a real network stack
+  ([kernel/net.c](kernel/net.c): Ethernet/ARP/IPv4/UDP/TCP/DHCP/HTTP) to
+  request a DHCP lease and perform real HTTP downloads — `netconnect` and
+  `download` in the shell, or "Connect" in the taskbar's network panel. No
+  Wi-Fi (needs per-chipset firmware-dependent drivers and a WPA
+  supplicant — thousands more lines of work), no DNS or TLS (both real,
+  separate, much larger projects), no fake "Connected" state for
+  unsupported hardware — see the Network section below
+- A real (not simulated) update mechanism given the constraint that
+  downloads need a literal IP (no DNS yet): an `update` command
   ([kernel/updatecmd.c](kernel/updatecmd.c)) validates and installs a staged
   kernel binary onto the writable data disk, and GRUB is configured to boot
   it automatically on the next restart instead of the ISO's built-in kernel
   (see the Updates section below)
+- ATA disk detection across all four legacy PATA slots (primary/secondary
+  bus × master/slave — [kernel/ata.c](kernel/ata.c)), not just one hardcoded
+  slot, and real arbitrary-depth directory nesting in the filesystem-aware
+  terminal (`cd`/`mkdir`/`ls` work at any depth, tracked as a real path
+  stack — see [kernel/terminal.c](kernel/terminal.c))
+- A real password-locked login gate: a from-scratch SHA-256
+  ([kernel/sha256.c](kernel/sha256.c), verified against independent
+  reference digests before being trusted for anything) salts and hashes
+  the password before it ever touches disk — never stored or compared as
+  plaintext ([kernel/auth.c](kernel/auth.c)). First boot requires setting a
+  password; every boot after that requires it to log in, with masked entry
+  and a real slowdown after repeated failures
+  ([kernel/login.c](kernel/login.c)). A single-credential gate (not a
+  multi-account user database) with an honestly-stated limitation: no
+  hardware RNG for the salt, and no full-disk encryption behind it, so
+  raw disk access still bypasses it — the same real limit any OS's local
+  password alone has
 
 ## The GUI
 
@@ -236,25 +255,47 @@ auroraOS fakes. What auroraOS has instead is real wired networking:
   EEPROM-read MAC address, DMA descriptor rings for TX/RX, polling
   send/receive. Only this one chipset is supported; anything else shows up
   in detection but has no driver behind it.
-- [kernel/net.c](kernel/net.c) layers just enough of a stack on top -
-  Ethernet framing, ARP, IPv4, UDP, and a DHCP client - to request and
-  receive a real IP lease. `netconnect` in the shell (or the "Connect"
-  button in the taskbar's network panel, wired through
-  [kernel/netinfo.c](kernel/netinfo.c)) runs the actual DHCP exchange and
-  reports the real result: a genuine leased IP/subnet/gateway/MAC on
-  success (verified end-to-end against QEMU's own SLIRP DHCP server - a
-  real `10.0.2.x` lease, not a fabricated one), or the real reason it
-  failed (no supported hardware, send failure, timeout) - never a fake
-  "Connected" state.
+- [kernel/net.c](kernel/net.c) layers a real (if minimal) stack on top:
+  Ethernet framing, ARP (a one-entry cache - resolving a same-subnet peer
+  or the gateway's MAC is genuinely required before any unicast packet can
+  go anywhere), IPv4, UDP, a DHCP client, and enough TCP (RFC 793 - a real
+  three-way handshake, real sequence/ack tracking, a four-way close; not a
+  general reusable transport - no retransmission or reordering, one
+  connection at a time) to do one HTTP/1.1 GET and get the response body
+  back.
+- `netconnect` in the shell (or "Connect" in the taskbar's network panel,
+  wired through [kernel/netinfo.c](kernel/netinfo.c)) runs the DHCP
+  exchange and reports the real result: a genuine leased
+  IP/subnet/gateway/MAC on success (verified against QEMU's own SLIRP DHCP
+  server - a real `10.0.2.x` lease), or the real reason it failed - never
+  a fake "Connected" state.
+- `download HOST_IP PORT PATH FILE` does a real HTTP GET and saves the
+  body to disk. No DNS (the host must be a literal IPv4 address) and no
+  TLS (plain HTTP only) - both real, separate, much larger projects,
+  stated as honest limitations rather than silently unsupported. Verified
+  against a real, independent HTTP server (Python's `http.server`, a
+  separate host process) through QEMU's SLIRP gateway: downloaded a file,
+  confirmed the saved content matched byte-for-byte, and confirmed a
+  genuine 404 was correctly detected and refused rather than saved as if
+  it were the requested file - cross-checked against the server's own
+  access log.
 
-One real bug worth noting since it's the kind of thing this stack is easy
-to get wrong silently: the TX/RX descriptor rings must be declared
-`volatile`, since hardware writes their status fields via DMA outside the
-compiler's view of program order. Without it, GCC at `-O2` legally hoists
-the status read in `e1000_send()`'s completion-polling loop out of the
-loop entirely, spinning on a stale cached value forever - every send
-appeared to hang/fail until this was fixed, confirmed by reproducing the
-failure with `volatile` removed and fixing it by restoring it.
+Two real bugs worth noting since they're the kind of thing this stack is
+easy to get wrong silently:
+
+- The TX/RX descriptor rings must be declared `volatile`, since hardware
+  writes their status fields via DMA outside the compiler's view of
+  program order. Without it, GCC at `-O2` legally hoists the status read
+  in `e1000_send()`'s completion-polling loop out of the loop entirely,
+  spinning on a stale cached value forever - every send appeared to
+  hang/fail until this was fixed, confirmed by reproducing the failure
+  with `volatile` removed and fixing it by restoring it.
+- SHA-256 (used by the login system below, not this networking code, but
+  the same "verify before trusting" lesson applies) was checked against
+  independent reference digests for several message lengths before being
+  trusted - one of the test *strings* was accidentally the wrong length
+  during that process, which briefly looked like an algorithm bug until
+  the test itself was checked.
 
 ### Updates
 
@@ -273,15 +314,57 @@ header (so it won't install garbage), and if valid, writes it as
 `/AURORAOS.UPD` - the exact file GRUB checks for. `reboot` (or a normal
 restart) then boots straight into it.
 
-The one honest limitation: auroraOS has no network or USB mass-storage
-driver yet, so there's no way for it to fetch `NEWKRNL.BIN` from anywhere
-on its own. Getting a new kernel build onto the data disk today means
-copying it there from the host machine - the same way the disk image
-itself gets created (e.g. with mtools' `mcopy -i auroraos_disk.img
-kernel_bin/auroraos.bin ::NEWKRNL.BIN`, or by mounting the image directly).
-Once it's there, `update` and the reboot are real, not simulated - this was
-verified end-to-end (install, reboot, GRUB finding and booting the new
-kernel from the data disk, filesystem left intact).
+Getting a new kernel build onto the data disk no longer strictly requires
+the host machine: `download HOST_IP PORT PATH NEWKRNL.BIN` (see the
+Network section above) can fetch it directly if it's served from
+somewhere auroraOS can reach by a literal IP address (no DNS yet). The
+host-copy path still works too - e.g. with mtools' `mcopy -i
+auroraos_disk.img kernel_bin/auroraos.bin ::NEWKRNL.BIN`, or by mounting
+the image directly - and remains the only option if there's no reachable
+HTTP server to fetch from. Once the file is staged either way, `update`
+and the reboot are real, not simulated - this was verified end-to-end
+(install, reboot, GRUB finding and booting the new kernel from the data
+disk, filesystem left intact).
+
+### Login / password gate
+
+auroraOS locks the machine behind a password, stored honestly: never in
+plaintext, always salted and hashed with a real cryptographic hash (see
+[kernel/sha256.c](kernel/sha256.c), a from-scratch SHA-256 verified
+against independent reference digests - see the bug note above - before
+being trusted). [kernel/auth.c](kernel/auth.c) writes the salt+hash to
+`AURAUSER.DAT` at the data disk's root; [kernel/login.c](kernel/login.c)
+is the console UI on top of it, wired into `kernel_main()` right after
+the filesystem mounts.
+
+First boot asks you to set a password (with confirmation - a mismatch is
+rejected and asked again) before the machine can be used at all. Every
+boot after that requires it: masked (`*`) entry, a real few-second
+slowdown after every 3 failed attempts (not just cosmetic - genuinely
+implemented with `timer_wait()`), and a normal boot into the shell/desktop
+once the correct password is entered. If no data disk is present at all,
+there's nowhere to store a password, so the gate is skipped with an
+explicit message rather than silently locking with no way to ever set one.
+
+This is one credential, not a multi-account user database - "user system"
+here means "the machine won't boot to a usable state without the right
+password," not separate accounts or permissions. And it's a real but
+limited lock: the salt comes from timer ticks + the CMOS RTC (there's no
+hardware RNG available), which is adequate for a salt's actual job but
+not cryptographically random, and there's no full-disk encryption behind
+any of this, so someone with the physical disk in hand (e.g. booting a
+live USB and reading the raw FAT16 image) can delete `AURAUSER.DAT` to
+remove the password - the same real limitation any OS's local password
+alone has without full-disk encryption, which remains a separate, much
+larger undertaking.
+
+Verified across real reboots in QEMU: first-boot setup (including a
+deliberately mismatched confirmation, correctly rejected), the gate
+genuinely blocking boot on the next restart, a wrong password rejected,
+the 3-attempt slowdown firing at exactly the third failure and recovering
+afterward, and the correct password unlocking the machine - checked
+against a hash actually read back from disk, not held in memory across
+the reboot.
 
 ## Filesystem, terminal, and custom programs
 
@@ -314,10 +397,11 @@ aurora:~$ ls
 HELLO.TXT  (17 bytes)
 ```
 
-`cd` supports exactly one level of subdirectories (`mkdir foo`, `cd foo`,
-`cd ..`) — FAT16 itself supports arbitrary nesting, but only this shallower
-shape has actually been built and tested here, and claiming more would
-be exactly the kind of untested corner this project tries hard to avoid.
+`cd` supports real arbitrary-depth nesting (`mkdir foo`, `cd foo`, `mkdir
+bar`, `cd bar`, ... `cd ..` pops exactly one level, plain `cd`/`cd /` reset
+straight to root), tracked as a real path stack up to 16 levels deep in
+[kernel/terminal.c](kernel/terminal.c) — verified by building a real
+three-level tree, navigating it, and confirming it survived a full reboot.
 Filenames follow FAT16's classic 8.3 rule (up to 8 characters, an optional
 3-character extension, automatically uppercased) — `mkdir`/`touch`/`echo
 >`/`compile` all report an error rather than silently truncating or
@@ -427,10 +511,18 @@ installer ISOs use. Concretely:
   existing OS's files (auroraOS only reads/writes its own separate FAT16
   disk — see "Filesystem, terminal, and custom programs" above), no way
   back except a reboot/power cycle. Test in QEMU first (`make run`) if you
-  want to see it before trying real hardware, and don't point auroraOS's
-  data-disk driver at a real hard drive you care about — it will format
-  whatever's attached at the primary-slave ATA position if that disk
-  doesn't already look like a valid FAT16 volume.
+  want to see it before trying real hardware, and think carefully before
+  booting this on a machine with a real hard drive you care about:
+  [kernel/ata.c](kernel/ata.c) probes all four legacy PATA slots
+  (primary/secondary bus × master/slave, skipping ATAPI/optical drives by
+  their IDENTIFY signature) and will format the *first* real ATA disk it
+  finds as FAT16 if that disk doesn't already look like a valid FAT16
+  volume — on real multi-drive hardware (as opposed to this project's own
+  single-data-disk QEMU setup), that could be a drive you didn't intend.
+  This driver only speaks legacy IDE/CSM-compatibility-mode PATA, not
+  AHCI, so it may simply find no disk at all on modern SATA-only hardware
+  without a CSM/legacy option in firmware — a real driver-coverage limit,
+  not a bug to work around.
 
 ## Project layout
 
