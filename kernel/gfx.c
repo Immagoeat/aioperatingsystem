@@ -13,6 +13,14 @@ static uint8_t *fb_addr;
 static uint32_t fb_pitch;
 static uint32_t fb_bpp;
 static uint8_t fb_red_pos, fb_green_pos, fb_blue_pos;
+/* True when the hardware's 32bpp pixel layout already matches
+ * gfx_color_t's own in-memory format (0x00RRGGBB, red in bits 16-23,
+ * green in 8-15, blue in 0-7) - the near-universal case for 32bpp VBE
+ * modes (see memory.c's fallback comment). When it holds, gfx_flip()
+ * can copy each row byte-for-byte instead of unpacking and repacking
+ * every pixel, which is what it otherwise has to do on every single
+ * frame regardless of whether anything on screen changed. */
+static bool fb_is_native_rgb888;
 
 static int screen_w = 1024;
 static int screen_h = 768;
@@ -34,6 +42,7 @@ bool gfx_init(void) {
 	fb_red_pos = fb.red_pos;
 	fb_green_pos = fb.green_pos;
 	fb_blue_pos = fb.blue_pos;
+	fb_is_native_rgb888 = (fb_bpp == 32 && fb_red_pos == 16 && fb_green_pos == 8 && fb_blue_pos == 0);
 
 	screen_w = (int)fb.width;
 	screen_h = (int)fb.height;
@@ -192,6 +201,32 @@ void gfx_set_font_scale(int scale) {
 
 void gfx_draw_char(int x, int y, char c, gfx_color_t fg) {
 	const uint8_t *glyph = font8x8_get_glyph(c);
+	int size = 8 * glyph_scale;
+
+	/* Fast path: the glyph's whole bounding box is on-screen (true for
+	 * the overwhelming majority of characters drawn - console text and
+	 * every window's labels), so each set pixel/block can be written
+	 * straight into the back buffer instead of going through
+	 * gfx_fill_rect()'s clamp-and-loop machinery every time, which is
+	 * pure overhead when there's nothing to clamp. gfx_draw_char() runs
+	 * once per character on every string this whole UI draws, so this
+	 * adds up across a frame far more than a single call's cost suggests. */
+	if (x >= 0 && y >= 0 && x + size <= screen_w && y + size <= screen_h) {
+		for (int row = 0; row < 8; row++) {
+			uint8_t bits = glyph[row];
+			if (bits == 0) continue;
+			for (int col = 0; col < 8; col++) {
+				if (!(bits & (0x80 >> col))) continue;
+				int px = x + col * glyph_scale, py = y + row * glyph_scale;
+				for (int yy = 0; yy < glyph_scale; yy++) {
+					gfx_color_t *dst = &back_buffer[(py + yy) * screen_w + px];
+					for (int xx = 0; xx < glyph_scale; xx++) dst[xx] = fg;
+				}
+			}
+		}
+		return;
+	}
+
 	for (int row = 0; row < 8; row++) {
 		uint8_t bits = glyph[row];
 		for (int col = 0; col < 8; col++) {
@@ -204,6 +239,23 @@ void gfx_draw_char(int x, int y, char c, gfx_color_t fg) {
 
 void gfx_draw_char_bg(int x, int y, char c, gfx_color_t fg, gfx_color_t bg) {
 	const uint8_t *glyph = font8x8_get_glyph(c);
+	int size = 8 * glyph_scale;
+
+	if (x >= 0 && y >= 0 && x + size <= screen_w && y + size <= screen_h) {
+		for (int row = 0; row < 8; row++) {
+			uint8_t bits = glyph[row];
+			for (int col = 0; col < 8; col++) {
+				gfx_color_t color = (bits & (0x80 >> col)) ? fg : bg;
+				int px = x + col * glyph_scale, py = y + row * glyph_scale;
+				for (int yy = 0; yy < glyph_scale; yy++) {
+					gfx_color_t *dst = &back_buffer[(py + yy) * screen_w + px];
+					for (int xx = 0; xx < glyph_scale; xx++) dst[xx] = color;
+				}
+			}
+		}
+		return;
+	}
+
 	for (int row = 0; row < 8; row++) {
 		uint8_t bits = glyph[row];
 		for (int col = 0; col < 8; col++) {
@@ -285,6 +337,28 @@ void gfx_blit_rgb_scaled(const unsigned char *src_rgb, int src_w, int src_h, int
 }
 
 void gfx_flip(void) {
+	/* Fast path: the hardware's 32bpp layout already matches
+	 * gfx_color_t's own format byte-for-byte, so there's nothing to
+	 * unpack/repack per pixel - just copy the bytes across. This is
+	 * the near-universal case (see fb_is_native_rgb888's declaration),
+	 * and gfx_flip() runs unconditionally every frame regardless of
+	 * whether anything on screen actually changed, so avoiding the
+	 * per-pixel shift/mask work here is a real, broad win rather than
+	 * a one-off optimization. A single memcpy covers the whole
+	 * framebuffer when there's no row padding (pitch == width * 4);
+	 * otherwise each row still gets one memcpy instead of per-pixel work. */
+	if (fb_is_native_rgb888) {
+		size_t row_bytes = (size_t)screen_w * 4;
+		if (fb_pitch == row_bytes) {
+			memcpy(fb_addr, back_buffer, row_bytes * (size_t)screen_h);
+		} else {
+			for (int y = 0; y < screen_h; y++) {
+				memcpy(fb_addr + (size_t)y * fb_pitch, &back_buffer[y * screen_w], row_bytes);
+			}
+		}
+		return;
+	}
+
 	for (int y = 0; y < screen_h; y++) {
 		uint8_t *dst_row = fb_addr + (size_t)y * fb_pitch;
 		gfx_color_t *src_row = &back_buffer[y * screen_w];

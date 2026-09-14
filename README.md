@@ -37,7 +37,17 @@ modern windowed desktop GUI a `gui` command away.
   [kernel/rtc.c](kernel/rtc.c)
 - A true-color linear-framebuffer graphics library: pixels, lines, rects,
   rounded rects, alpha blending, soft drop shadows, an 8x8 bitmap font
-  (scalable), and a back buffer — see [kernel/gfx.c](kernel/gfx.c)
+  (scalable), and a back buffer — see [kernel/gfx.c](kernel/gfx.c).
+  `gfx_flip()` (which unconditionally re-packs the whole framebuffer every
+  single frame, whether or not anything on screen changed) takes a fast
+  path — a straight `memcpy` instead of per-pixel shift/mask work — when
+  the hardware's 32bpp pixel layout already matches the internal color
+  format byte-for-byte, which is the near-universal case; `gfx_draw_char()`
+  similarly writes glyph pixels directly into the back buffer instead of
+  through `gfx_fill_rect()`'s clamp-and-loop machinery when the glyph is
+  fully on-screen (also the common case). Both fall back to the original
+  per-pixel path when those conditions don't hold, so correctness doesn't
+  depend on either assumption.
 - A software text console rendered on the graphics framebuffer (there is no
   legacy VGA text mode in this design — see [kernel/console.c](kernel/console.c))
 - A modern-flat-design windowing GUI: soft shadows, rounded corners,
