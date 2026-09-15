@@ -527,6 +527,17 @@ struct html_page {
 };
 void html_layout(const uint8_t *html_bytes, uint32_t html_len, struct html_page *page, int wrap_cols);
 
+/* --- inflate.c: a real DEFLATE decompressor (RFC 1951) plus a gzip
+ * container wrapper (RFC 1952), for decoding HTTP responses sent with
+ * `Content-Encoding: gzip` - real servers (python.org, among others)
+ * send these unconditionally regardless of Accept-Encoding. Returns
+ * the decompressed length, or 0 on any malformed/truncated input or
+ * if decompressing would exceed out_max. Does not verify the gzip
+ * trailer's CRC32 (no CRC32 implementation exists here) - relies on
+ * inflate_raw()'s own structural validity checks instead. */
+uint32_t inflate_raw(const uint8_t *data, uint32_t data_len, uint8_t *out, uint32_t out_max);
+uint32_t gzip_decompress(const uint8_t *data, uint32_t data_len, uint8_t *out, uint32_t out_max);
+
 /* --- wm.c --- */
 void wm_init(void);
 void wm_run(void);

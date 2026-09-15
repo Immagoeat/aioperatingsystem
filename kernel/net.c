@@ -912,13 +912,39 @@ static bool http_extract_body(const uint8_t *response, uint32_t response_len, vo
 	}
 
 	bool chunked = http_header_contains_ci(response, body_start, "Transfer-Encoding: chunked");
+	bool gzipped = http_header_contains_ci(response, body_start, "Content-Encoding: gzip");
+
+	/* Transfer-Encoding (how the body was framed on the wire) and
+	 * Content-Encoding (how the body's actual content was compressed)
+	 * are independent and can both be present - a body can be both
+	 * chunked and gzipped, in which case dechunking has to happen
+	 * first (it's the wire framing) before the result can be treated
+	 * as a gzip stream at all. Real servers (python.org, among many
+	 * others) send Content-Encoding: gzip unconditionally regardless
+	 * of what this client's request asked for - see inflate.c's file
+	 * comment. */
+	static uint8_t dechunked[65536];
+	const uint8_t *body_ptr;
+	uint32_t body_len;
 
 	if (chunked) {
-		*out_body_len = http_decode_chunked(response + body_start, response_len - body_start, (uint8_t *)out_body, max_body_len);
+		body_len = http_decode_chunked(response + body_start, response_len - body_start, dechunked, sizeof(dechunked));
+		body_ptr = dechunked;
 	} else {
-		uint32_t body_len = response_len - body_start;
+		body_ptr = response + body_start;
+		body_len = response_len - body_start;
+	}
+
+	if (gzipped) {
+		uint32_t decompressed_len = gzip_decompress(body_ptr, body_len, (uint8_t *)out_body, max_body_len);
+		if (decompressed_len == 0 && body_len > 0) {
+			local_strcpy_bounded(out_error, "Failed to decompress gzip-encoded response body.", out_error_len);
+			return false;
+		}
+		*out_body_len = decompressed_len;
+	} else {
 		if (body_len > max_body_len) body_len = max_body_len;
-		memcpy(out_body, response + body_start, body_len);
+		memcpy(out_body, body_ptr, body_len);
 		*out_body_len = body_len;
 	}
 	return true;
