@@ -125,9 +125,9 @@ static void paint_about(struct window *w) {
 	gfx_draw_string(x, y, "minimize, and fullscreen it.", COL_TEXT_DIM); y += lh;
 	gfx_draw_string(x, y, "Click a taskbar icon to", COL_TEXT_DIM); y += lh;
 	gfx_draw_string(x, y, "focus or restore a window.", COL_TEXT_DIM); y += lh;
-	gfx_draw_string(x, y, "Press / or the Windows key", COL_TEXT_DIM); y += lh;
-	gfx_draw_string(x, y, "to search for apps, Ctrl+Q", COL_TEXT_DIM); y += lh;
-	gfx_draw_string(x, y, "for the shell.", COL_TEXT_DIM);
+	gfx_draw_string(x, y, "Press the Windows key to", COL_TEXT_DIM); y += lh;
+	gfx_draw_string(x, y, "search for apps, Ctrl+Q for", COL_TEXT_DIM); y += lh;
+	gfx_draw_string(x, y, "the shell.", COL_TEXT_DIM);
 }
 
 static void paint_counter(struct window *w) {
@@ -1498,7 +1498,7 @@ void wm_run(void) {
 				return;
 			} else if (c == CTRL_KEY('w')) {
 				cycle_wallpaper();
-			} else if (c == '/' || c == KEY_SUPER) {
+			} else if (c == KEY_SUPER) {
 				open_search();
 			} else if (topmost_visible >= 0 && windows[topmost_visible].key) {
 				/* Global shortcuts above always win even while a window
