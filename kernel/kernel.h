@@ -403,6 +403,17 @@ int timezone_option_count(void);
 const struct timezone_option *timezone_option_get(int index); /* NULL if index is out of range */
 int timezone_find_closest_option(int offset_minutes); /* index of the listed option nearest the given offset */
 
+/* UI scale - see settings.c's file comment on why this exists in
+ * place of a real (infeasible) resolution setting. `scale` is passed
+ * directly to gfx_set_font_scale(). */
+struct ui_scale_option {
+	const char *label;
+	int scale;
+};
+int ui_scale_option_count(void);
+const struct ui_scale_option *ui_scale_option_get(int index); /* NULL if index is out of range */
+int ui_scale_find_option(int scale); /* index of the option matching this scale, or "Medium" if none match */
+
 /* --- noteedit.c: the text-buffer editing core shared by both of
  * nano's renderers - the full-screen console version (terminal.c's
  * `nano` command) and the windowed version (wm.c's "Text Editor" app).
@@ -475,6 +486,7 @@ void gfx_draw_hline(int x, int y, int w, gfx_color_t color);
 void gfx_draw_vline(int x, int y, int h, gfx_color_t color);
 void gfx_draw_line(int x0, int y0, int x1, int y1, gfx_color_t color);
 void gfx_set_font_scale(int scale);
+int gfx_font_scale(void); /* the scale last passed to gfx_set_font_scale() */
 int gfx_char_width(void);
 int gfx_char_height(void);
 void gfx_draw_char(int x, int y, char c, gfx_color_t fg);

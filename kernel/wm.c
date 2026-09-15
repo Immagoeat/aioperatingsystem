@@ -29,6 +29,25 @@
 #define COL_WHITE          GFX_RGB(0xFF, 0xFF, 0xFF)
 #define COL_BLACK          GFX_RGB(0x00, 0x00, 0x00)
 
+/* Small procedural vector icons (drawn with the same gfx_fill_rect/
+ * gfx_draw_line primitives every app already uses), one per launchable
+ * app, replacing the old flat accent-color swatch in the search list.
+ * Genuinely drawn shapes rather than embedded bitmap art - there's no
+ * real icon artwork available to embed here (see wallpaper.c/
+ * img_to_c.py for how actual bitmap assets get embedded when they do
+ * exist), and a simple recognizable glyph per app is the honest
+ * equivalent for a from-scratch OS with no icon theme of its own. */
+enum app_icon {
+	ICON_NONE = 0,
+	ICON_INFO,      /* About */
+	ICON_CLOCK,     /* Uptime */
+	ICON_PALETTE,   /* Palette */
+	ICON_GEAR,      /* Settings */
+	ICON_DOCUMENT,  /* Text Editor */
+	ICON_GLOBE,     /* Browser */
+	ICON_TERMINAL,  /* Terminal */
+};
+
 struct window;
 typedef void (*window_paint_fn)(struct window *w);
 /* Per-window keyboard input, for apps that need more than a click (the
@@ -39,12 +58,33 @@ typedef void (*window_paint_fn)(struct window *w);
  * paint-only apps like Palette are never sent keys. */
 typedef void (*window_key_fn)(struct window *w, char c);
 
+/* Per-window mouse-click input, for apps that need to react to a
+ * click within their own content area (Settings' dropdowns) rather
+ * than just keyboard input. `x`/`y` are already window-relative
+ * (click position minus w->x/w->y), so a click handler never needs to
+ * know its own window's screen position. Like window_key_fn, only the
+ * topmost non-minimized window ever receives one, and only after the
+ * titlebar buttons/drag handling above it in handle_click() have all
+ * had a chance to claim the click first. */
+typedef void (*window_click_fn)(struct window *w, int x, int y);
+
+/* Computes an app's minimum content size from its actual text/layout
+ * at the current font scale (gfx_char_width()/height()), instead of a
+ * fixed pixel constant tuned by eye for one scale - the same window
+ * that comfortably fits its text at one UI scale would either clip it
+ * or waste space at another without this. Called once when a window
+ * is (re)opened and again whenever the UI scale changes (see
+ * rescale_all_windows()), not every frame - none of these apps' fixed
+ * chrome text changes on its own between those points. */
+typedef void (*window_natural_size_fn)(int *out_w, int *out_h);
+
 struct window {
 	bool used;
 	int x, y, w, h;
 	char title[32];
 	window_paint_fn paint;
 	window_key_fn key; /* NULL for apps with no keyboard interaction */
+	window_click_fn click; /* NULL for apps with no content-area click interaction */
 	int counter;
 	gfx_color_t accent;
 
@@ -114,20 +154,67 @@ static int topmost_window_at(int x, int y) {
 }
 
 /* --- demo apps --- */
+/* One source of truth for both drawing and sizing (see
+ * about_natural_size() below) - a fixed pixel window tuned by eye for
+ * one font scale would either clip this text or waste space at any
+ * other scale, so the window's size is derived from these same
+ * strings via gfx_string_width()/gfx_char_height() instead of a
+ * separately-guessed constant. line[0] is drawn in the accent color
+ * with extra spacing below (the "title"); the rest are dimmed body
+ * text, with one extra blank-line's worth of gap after line[2]
+ * (matching the paragraph break the old hardcoded version had). */
+enum about_style { ABOUT_TITLE, ABOUT_BODY, ABOUT_DIM };
+struct about_line { const char *text; enum about_style style; bool extra_gap_after; };
+static const struct about_line about_lines[] = {
+	{ "auroraOS", ABOUT_TITLE, false },
+	{ "A tiny hobby kernel with a", ABOUT_BODY, false },
+	{ "real graphical desktop.", ABOUT_BODY, true },
+	{ "Drag windows by their", ABOUT_DIM, false },
+	{ "title bar. The dots close,", ABOUT_DIM, false },
+	{ "minimize, and fullscreen it.", ABOUT_DIM, false },
+	{ "Click a taskbar icon to", ABOUT_DIM, false },
+	{ "focus or restore a window.", ABOUT_DIM, false },
+	{ "Press the Windows key to", ABOUT_DIM, false },
+	{ "search for apps, Ctrl+Q for", ABOUT_DIM, false },
+	{ "the shell.", ABOUT_DIM, false },
+};
+#define ABOUT_LINE_COUNT (int)(sizeof(about_lines) / sizeof(about_lines[0]))
+
+static void about_natural_size(int *out_w, int *out_h) {
+	int lh = gfx_char_height() + 6;
+	int max_w = 0, total_h = 0;
+	for (int i = 0; i < ABOUT_LINE_COUNT; i++) {
+		int sw = gfx_string_width(about_lines[i].text);
+		if (sw > max_w) max_w = sw;
+		total_h += lh + (about_lines[i].style == ABOUT_TITLE ? 4 : 0) + (about_lines[i].extra_gap_after ? 8 : 0);
+	}
+	*out_w = max_w + 2 * PADDING;
+	*out_h = total_h + 2 * PADDING;
+}
+
 static void paint_about(struct window *w) {
 	int x = w->x + PADDING, y = w->y + TITLEBAR_H + PADDING;
 	int lh = gfx_char_height() + 6;
-	gfx_draw_string(x, y, "auroraOS", w->accent); y += lh + 4;
-	gfx_draw_string(x, y, "A tiny hobby kernel with a", COL_TEXT); y += lh;
-	gfx_draw_string(x, y, "real graphical desktop.", COL_TEXT); y += lh + 8;
-	gfx_draw_string(x, y, "Drag windows by their", COL_TEXT_DIM); y += lh;
-	gfx_draw_string(x, y, "title bar. The dots close,", COL_TEXT_DIM); y += lh;
-	gfx_draw_string(x, y, "minimize, and fullscreen it.", COL_TEXT_DIM); y += lh;
-	gfx_draw_string(x, y, "Click a taskbar icon to", COL_TEXT_DIM); y += lh;
-	gfx_draw_string(x, y, "focus or restore a window.", COL_TEXT_DIM); y += lh;
-	gfx_draw_string(x, y, "Press the Windows key to", COL_TEXT_DIM); y += lh;
-	gfx_draw_string(x, y, "search for apps, Ctrl+Q for", COL_TEXT_DIM); y += lh;
-	gfx_draw_string(x, y, "the shell.", COL_TEXT_DIM);
+	for (int i = 0; i < ABOUT_LINE_COUNT; i++) {
+		const struct about_line *l = &about_lines[i];
+		gfx_color_t color = l->style == ABOUT_TITLE ? w->accent : (l->style == ABOUT_BODY ? COL_TEXT : COL_TEXT_DIM);
+		gfx_draw_string(x, y, l->text, color);
+		y += lh + (l->style == ABOUT_TITLE ? 4 : 0) + (l->extra_gap_after ? 8 : 0);
+	}
+}
+
+/* Uptime's actual content is short and fixed ("System uptime" plus a
+ * counter that only grows a few digits over any realistic session),
+ * so the real sizing constraint is leaving enough room for the
+ * progress bar to read as a bar rather than a sliver - expressed here
+ * in character-cell widths so it scales with the font the same way
+ * the text does, rather than a flat pixel guess. */
+static void counter_natural_size(int *out_w, int *out_h) {
+	int cw = gfx_char_width(), ch = gfx_char_height();
+	int text_w = gfx_string_width("System uptime");
+	int bar_w = 22 * cw; /* wide enough to read as a progress bar */
+	*out_w = (text_w > bar_w ? text_w : bar_w) + 2 * PADDING;
+	*out_h = (ch + 6) * 2 + 12 + 10 + 2 * PADDING;
 }
 
 static void paint_counter(struct window *w) {
@@ -155,6 +242,17 @@ static void paint_counter(struct window *w) {
 	if (fill > 4) gfx_fill_round_rect(x, y, fill, 10, 5, w->accent);
 }
 
+/* Palette has no text to clip (it's just colored swatches that
+ * already scale to fill whatever width the window has), so its
+ * "natural size" is really just a comfortable minimum swatch size,
+ * expressed in character-cell units so it still grows/shrinks
+ * proportionally with the font scale like every other window here. */
+static void palette_natural_size(int *out_w, int *out_h) {
+	int cell = gfx_char_height() * 2; /* comfortable swatch size relative to the current font */
+	*out_w = 4 * cell + 3 * 8 + 2 * PADDING;
+	*out_h = 2 * cell + 8 + 2 * PADDING;
+}
+
 static void paint_palette(struct window *w) {
 	static const gfx_color_t swatches[8] = {
 		GFX_RGB(0xFF, 0x5F, 0x57), GFX_RGB(0xFF, 0xBD, 0x2E),
@@ -172,72 +270,272 @@ static void paint_palette(struct window *w) {
 }
 
 /* --- Settings: a real window, like Palette, rather than a console
- * takeover - see settings.c for the timezone data/logic this draws.
- * Per-window state (which slot in the timezone list is highlighted),
- * indexed by window slot since only one Settings window can exist at
- * a time (same one-per-name rule every app here follows). */
-static int settings_selected[MAX_WINDOWS];
-static bool settings_applied[MAX_WINDOWS]; /* true once Enter has been pressed this session, to show a confirmation */
+ * takeover - see settings.c for the timezone/UI-scale data this
+ * draws. Two dropdowns (Timezone, UI Scale), each a closed field
+ * showing the current selection that opens into a scrollable overlay
+ * list on click - the standard dropdown pattern already used
+ * elsewhere in this WM for the search panel and network panel (see
+ * handle_click()), just attached to one specific window's content
+ * area via window_click_fn instead of the desktop chrome. Per-window
+ * state, indexed by window slot since only one Settings window can
+ * exist at a time (same one-per-name rule every app here follows). */
+static void rescale_all_windows(void); /* defined below, after the app registry it needs to read - forward-declared since Settings (above that point) is what triggers it */
+
+enum settings_dropdown { SETTINGS_DROPDOWN_NONE = 0, SETTINGS_DROPDOWN_TIMEZONE, SETTINGS_DROPDOWN_SCALE };
+static int settings_selected[MAX_WINDOWS];       /* timezone index */
+static int settings_scale_selected[MAX_WINDOWS]; /* ui_scale index */
+static bool settings_applied[MAX_WINDOWS];       /* true once a change has actually been applied this session, to show a confirmation */
+static enum settings_dropdown settings_open[MAX_WINDOWS];
+static int settings_dropdown_scroll[MAX_WINDOWS]; /* first visible row of whichever dropdown is open */
+
+/* Layout constants shared between paint_settings() (which draws at
+ * these positions) and key_settings()/click_settings() (which need
+ * the same positions to hit-test against) - kept as one set of
+ * functions computing them from the window/font metrics so the two
+ * can never drift out of sync with each other. */
+/* All fields here are window-relative (relative to the window's own
+ * top-left corner, i.e. what you'd add w->x/w->y to for an actual
+ * screen position) - both paint_settings() (which adds w->x/w->y
+ * before every gfx_* call) and click_settings() (which receives
+ * already window-relative coordinates from handle_click()'s
+ * dispatch - see window_click_fn's doc comment) work in this same
+ * space, so a click can never land on the wrong field due to one of
+ * them silently using absolute screen coordinates while the other
+ * uses window-relative ones. */
+struct settings_layout {
+	int x, field_w, field_h;
+	int tz_field_y;
+	int scale_field_y;
+	int lh;
+};
+
+static struct settings_layout settings_compute_layout(struct window *w) {
+	struct settings_layout L;
+	L.x = PADDING;
+	L.field_w = w->w - 2 * PADDING;
+	L.lh = gfx_char_height() + 4;
+	L.field_h = gfx_char_height() + 14;
+
+	int y = TITLEBAR_H + PADDING;
+	y += L.lh + 6; /* "Timezone" section title */
+	y += L.lh * 3 + 10; /* the three description lines below it */
+	L.tz_field_y = y;
+	y += L.field_h + 20;
+	y += L.lh + 6; /* "UI Scale" section title */
+	y += L.lh * 2 + 10; /* its two description lines */
+	L.scale_field_y = y;
+
+	return L;
+}
+
+/* Draws one closed dropdown field - shared between the Timezone and
+ * UI Scale dropdowns since they're otherwise identical UI, just
+ * backed by different option lists. The open overlay list itself is
+ * a separate draw (draw_dropdown_overlay() below), issued afterwards
+ * so it floats on top of whatever's below it rather than pushing
+ * later content down - the same layering the search/network panels
+ * already use. */
+static void draw_dropdown_field(int x, int field_y, int field_w, int field_h,
+                                 const char *current_label, bool is_open) {
+	gfx_fill_round_rect(x, field_y, field_w, field_h, 6, is_open ? COL_WIN_BODY_ALT : COL_TASKBAR);
+	gfx_draw_string(x + 10, field_y + (field_h - gfx_char_height()) / 2, current_label, COL_TEXT);
+
+	/* small chevron on the right edge, pointing down when closed / up
+	 * when open, so there's a visible affordance that this is
+	 * expandable rather than just a label */
+	int chev_x = x + field_w - 20, chev_y = field_y + field_h / 2;
+	if (is_open) {
+		gfx_draw_line(chev_x - 4, chev_y + 2, chev_x, chev_y - 3, COL_TEXT_DIM);
+		gfx_draw_line(chev_x, chev_y - 3, chev_x + 4, chev_y + 2, COL_TEXT_DIM);
+	} else {
+		gfx_draw_line(chev_x - 4, chev_y - 2, chev_x, chev_y + 3, COL_TEXT_DIM);
+		gfx_draw_line(chev_x, chev_y + 3, chev_x + 4, chev_y - 2, COL_TEXT_DIM);
+	}
+}
+
+#define SETTINGS_DROPDOWN_VISIBLE_ROWS 6
+
+static void draw_dropdown_overlay(int x, int field_y, int field_w, int field_h, int row_h,
+                                   int count, int selected, int scroll,
+                                   const char *(*label_at)(int)) {
+	int visible = count < SETTINGS_DROPDOWN_VISIBLE_ROWS ? count : SETTINGS_DROPDOWN_VISIBLE_ROWS;
+	int overlay_y = field_y + field_h + 4;
+	int overlay_h = visible * row_h + 8;
+
+	gfx_draw_soft_shadow(x, overlay_y, field_w, overlay_h, 8, 12);
+	gfx_fill_round_rect(x, overlay_y, field_w, overlay_h, 8, COL_TITLE_ACT);
+
+	for (int i = 0; i < visible; i++) {
+		int opt_index = scroll + i;
+		if (opt_index >= count) break;
+		int row_y = overlay_y + 4 + i * row_h;
+		bool is_selected = (opt_index == selected);
+		if (is_selected) gfx_fill_round_rect(x + 4, row_y, field_w - 8, row_h - 2, 5, COL_TASKBAR_ACTIVE);
+		gfx_draw_string(x + 12, row_y + (row_h - gfx_char_height()) / 2 - 1, label_at(opt_index), is_selected ? COL_TEXT : COL_TEXT_DIM);
+	}
+}
+
+static const char *timezone_label_at(int i) {
+	const struct timezone_option *opt = timezone_option_get(i);
+	return opt ? opt->label : "";
+}
+static const char *ui_scale_label_at(int i) {
+	const struct ui_scale_option *opt = ui_scale_option_get(i);
+	return opt ? opt->label : "";
+}
 
 static void paint_settings(struct window *w) {
 	int idx = (int)(w - windows);
-	int x = w->x + PADDING, y = w->y + TITLEBAR_H + PADDING;
-	int lh = gfx_char_height() + 4;
+	struct settings_layout L = settings_compute_layout(w);
+	/* L.* is window-relative (see settings_compute_layout()'s comment);
+	 * every gfx_* call below needs real screen coordinates, so w->x/
+	 * w->y are added right here, once, rather than scattered through
+	 * every draw call. */
+	int x = w->x + L.x, y = w->y + TITLEBAR_H + PADDING;
 
-	gfx_draw_string(x, y, "Timezone", w->accent); y += lh + 6;
-	gfx_draw_string(x, y, "auroraOS can't detect your region (no", COL_TEXT_DIM); y += lh;
-	gfx_draw_string(x, y, "network/GPS) - it assumes the clock is", COL_TEXT_DIM); y += lh;
-	gfx_draw_string(x, y, "already local time. Pick a UTC offset:", COL_TEXT_DIM); y += lh + 10;
+	gfx_draw_string(x, y, "Timezone", w->accent); y += L.lh + 6;
+	gfx_draw_string(x, y, "auroraOS can't detect your region (no", COL_TEXT_DIM); y += L.lh;
+	gfx_draw_string(x, y, "network/GPS) - it assumes the clock is", COL_TEXT_DIM); y += L.lh;
+	gfx_draw_string(x, y, "already local time. Pick a UTC offset:", COL_TEXT_DIM); y += L.lh + 10;
 
-	int list_top = y;
-	int row_h = lh + 4;
-	int max_visible = (w->h + TITLEBAR_H - (list_top - w->y) - PADDING - 28) / row_h;
-	if (max_visible < 1) max_visible = 1;
+	draw_dropdown_field(x, w->y + L.tz_field_y, L.field_w, L.field_h, timezone_label_at(settings_selected[idx]), settings_open[idx] == SETTINGS_DROPDOWN_TIMEZONE);
+	y = w->y + L.tz_field_y + L.field_h + 20;
 
-	int count = timezone_option_count();
-	int selected = settings_selected[idx];
-	int visible_start = selected - max_visible / 2;
-	if (visible_start < 0) visible_start = 0;
-	if (visible_start > count - max_visible) visible_start = count - max_visible;
-	if (visible_start < 0) visible_start = 0;
-	int visible_end = visible_start + max_visible;
-	if (visible_end > count) visible_end = count;
+	gfx_draw_string(x, y, "UI Scale", w->accent); y += L.lh + 6;
+	gfx_draw_string(x, y, "There's no real video-mode switch here,", COL_TEXT_DIM); y += L.lh;
+	gfx_draw_string(x, y, "so this resizes the desktop's UI instead:", COL_TEXT_DIM); y += L.lh + 10;
 
-	for (int i = visible_start; i < visible_end; i++) {
-		const struct timezone_option *opt = timezone_option_get(i);
-		bool is_selected = (i == selected);
-		if (is_selected) {
-			gfx_fill_round_rect(x - 4, y - 2, w->w - 2 * PADDING + 8, row_h - 2, 5, COL_TASKBAR_ACTIVE);
-		}
-		gfx_draw_string(x, y, opt->label, is_selected ? COL_TEXT : COL_TEXT_DIM);
-		y += row_h;
-	}
+	draw_dropdown_field(x, w->y + L.scale_field_y, L.field_w, L.field_h, ui_scale_label_at(settings_scale_selected[idx]), settings_open[idx] == SETTINGS_DROPDOWN_SCALE);
 
 	int footer_y = w->y + w->h + TITLEBAR_H - 24;
 	if (settings_applied[idx]) {
-		gfx_draw_string(x, footer_y, "Timezone updated.", GFX_RGB(0x28, 0xC8, 0x40));
+		gfx_draw_string(x, footer_y, "Applied.", GFX_RGB(0x28, 0xC8, 0x40));
 	} else {
-		gfx_draw_string(x, footer_y, "Arrows move, Enter applies", COL_TEXT_DIM);
+		gfx_draw_string(x, footer_y, "Click a field to choose", COL_TEXT_DIM);
 	}
+
+	/* the open dropdown's overlay is drawn last so it floats over
+	 * everything below it (the other field, the footer) rather than
+	 * being drawn-under and looking clipped */
+	if (settings_open[idx] == SETTINGS_DROPDOWN_TIMEZONE) {
+		draw_dropdown_overlay(x, w->y + L.tz_field_y, L.field_w, L.field_h, L.lh + 4,
+			timezone_option_count(), settings_selected[idx], settings_dropdown_scroll[idx], timezone_label_at);
+	} else if (settings_open[idx] == SETTINGS_DROPDOWN_SCALE) {
+		draw_dropdown_overlay(x, w->y + L.scale_field_y, L.field_w, L.field_h, L.lh + 4,
+			ui_scale_option_count(), settings_scale_selected[idx], settings_dropdown_scroll[idx], ui_scale_label_at);
+	}
+}
+
+static void settings_apply_scale(int idx) {
+	const struct ui_scale_option *opt = ui_scale_option_get(settings_scale_selected[idx]);
+	if (!opt) return;
+	gfx_set_font_scale(opt->scale);
+	rescale_all_windows();
+	settings_applied[idx] = true;
 }
 
 static void key_settings(struct window *w, char c) {
 	int idx = (int)(w - windows);
-	int count = timezone_option_count();
+
+	if (settings_open[idx] == SETTINGS_DROPDOWN_NONE) {
+		if (c == '\n') {
+			settings_open[idx] = SETTINGS_DROPDOWN_TIMEZONE;
+			settings_dropdown_scroll[idx] = settings_selected[idx];
+		}
+		return;
+	}
+
+	int count = settings_open[idx] == SETTINGS_DROPDOWN_TIMEZONE ? timezone_option_count() : ui_scale_option_count();
+	int *selected = settings_open[idx] == SETTINGS_DROPDOWN_TIMEZONE ? &settings_selected[idx] : &settings_scale_selected[idx];
 
 	if (c == KEY_ARROW_UP) {
-		if (settings_selected[idx] > 0) settings_selected[idx]--;
-		settings_applied[idx] = false;
+		if (*selected > 0) (*selected)--;
+		if (*selected < settings_dropdown_scroll[idx]) settings_dropdown_scroll[idx] = *selected;
 	} else if (c == KEY_ARROW_DOWN) {
-		if (settings_selected[idx] < count - 1) settings_selected[idx]++;
-		settings_applied[idx] = false;
+		if (*selected < count - 1) (*selected)++;
+		if (*selected >= settings_dropdown_scroll[idx] + SETTINGS_DROPDOWN_VISIBLE_ROWS) settings_dropdown_scroll[idx] = *selected - SETTINGS_DROPDOWN_VISIBLE_ROWS + 1;
+	} else if (c == 27) { /* Escape: close without changing anything further */
+		settings_open[idx] = SETTINGS_DROPDOWN_NONE;
 	} else if (c == '\n') {
-		const struct timezone_option *opt = timezone_option_get(settings_selected[idx]);
-		if (opt) {
-			rtc_set_timezone_offset_minutes(opt->offset_minutes);
-			settings_applied[idx] = true;
+		if (settings_open[idx] == SETTINGS_DROPDOWN_TIMEZONE) {
+			const struct timezone_option *opt = timezone_option_get(settings_selected[idx]);
+			if (opt) { rtc_set_timezone_offset_minutes(opt->offset_minutes); settings_applied[idx] = true; }
+		} else {
+			settings_apply_scale(idx);
+		}
+		settings_open[idx] = SETTINGS_DROPDOWN_NONE;
+	}
+}
+
+static void click_settings(struct window *w, int x, int y) {
+	int idx = (int)(w - windows);
+	struct settings_layout L = settings_compute_layout(w);
+
+	if (settings_open[idx] != SETTINGS_DROPDOWN_NONE) {
+		int field_y = settings_open[idx] == SETTINGS_DROPDOWN_TIMEZONE ? L.tz_field_y : L.scale_field_y;
+		int count = settings_open[idx] == SETTINGS_DROPDOWN_TIMEZONE ? timezone_option_count() : ui_scale_option_count();
+		int row_h = L.lh + 4;
+		int overlay_y = field_y + L.field_h + 4;
+		int visible = count < SETTINGS_DROPDOWN_VISIBLE_ROWS ? count : SETTINGS_DROPDOWN_VISIBLE_ROWS;
+
+		if (y >= overlay_y + 4 && y < overlay_y + 4 + visible * row_h && x >= L.x && x < L.x + L.field_w) {
+			int row = (y - (overlay_y + 4)) / row_h;
+			int opt_index = settings_dropdown_scroll[idx] + row;
+			if (opt_index >= 0 && opt_index < count) {
+				if (settings_open[idx] == SETTINGS_DROPDOWN_TIMEZONE) {
+					settings_selected[idx] = opt_index;
+					const struct timezone_option *opt = timezone_option_get(opt_index);
+					if (opt) { rtc_set_timezone_offset_minutes(opt->offset_minutes); settings_applied[idx] = true; }
+				} else {
+					settings_scale_selected[idx] = opt_index;
+					settings_apply_scale(idx);
+				}
+			}
+			settings_open[idx] = SETTINGS_DROPDOWN_NONE;
+			return;
+		}
+		/* clicked outside the open overlay: close it without changing
+		 * the selection, same as clicking away from search/network */
+		settings_open[idx] = SETTINGS_DROPDOWN_NONE;
+		return;
+	}
+
+	if (x >= L.x && x < L.x + L.field_w) {
+		if (y >= L.tz_field_y && y < L.tz_field_y + L.field_h) {
+			settings_open[idx] = SETTINGS_DROPDOWN_TIMEZONE;
+			settings_dropdown_scroll[idx] = settings_selected[idx];
+			settings_applied[idx] = false;
+		} else if (y >= L.scale_field_y && y < L.scale_field_y + L.field_h) {
+			settings_open[idx] = SETTINGS_DROPDOWN_SCALE;
+			settings_dropdown_scroll[idx] = settings_scale_selected[idx];
+			settings_applied[idx] = false;
 		}
 	}
+}
+
+/* Settings' own natural size: wide enough for its longest fixed
+ * description line or timezone label (whichever is longer), tall
+ * enough for both dropdown sections plus the footer hint - all
+ * measured from the actual strings via gfx_string_width() rather than
+ * a guessed pixel constant, the same approach as About/Uptime/
+ * Palette above. */
+static void settings_natural_size(int *out_w, int *out_h) {
+	int lh = gfx_char_height() + 4;
+	int field_h = gfx_char_height() + 14;
+
+	int max_w = gfx_string_width("network/GPS) - it assumes the clock is");
+	int w2 = gfx_string_width("There's no real video-mode switch here,");
+	if (w2 > max_w) max_w = w2;
+	for (int i = 0; i < timezone_option_count(); i++) {
+		int lw = gfx_string_width(timezone_label_at(i)) + 20; /* +20 for the chevron */
+		if (lw > max_w) max_w = lw;
+	}
+	*out_w = max_w + 2 * PADDING;
+
+	int h = lh + 6 + lh * 3 + 10 + field_h + 20 /* Timezone section */
+	       + lh + 6 + lh * 2 + 10 + field_h     /* UI Scale section */
+	       + 24 + PADDING;                       /* footer + trailing margin */
+	*out_h = h;
 }
 
 /* --- Text Editor: a real window, like Palette, rather than a console
@@ -258,6 +556,19 @@ struct texteditor_state {
 	bool loaded; /* true once note_load() has actually run for `filename` */
 };
 static struct texteditor_state texteditor[MAX_WINDOWS];
+
+/* Text Editor's content (line numbers + arbitrary file text) is
+ * inherently open-ended and already scrolls both directions, so
+ * there's no single "natural size" that fits everything the way
+ * About's fixed text does - this is a comfortable minimum in
+ * character-cell units instead, wide/tall enough for real editing
+ * without immediately needing to scroll, and scaling correctly with
+ * the font the same way every other window here does. */
+static void texteditor_natural_size(int *out_w, int *out_h) {
+	int cw = gfx_char_width(), ch = gfx_char_height();
+	*out_w = 65 * cw + 2 * PADDING;
+	*out_h = 24 * (ch + 4) + 2 * PADDING;
+}
 
 static void paint_texteditor(struct window *w) {
 	int idx = (int)(w - windows);
@@ -510,6 +821,17 @@ static void browser_load(struct window *w) {
 	st->has_page = true;
 }
 
+/* Browser content is a rendered web page - inherently open-ended and
+ * already scrollable, so like Text Editor this is a comfortable
+ * minimum in character-cell units (wide enough that html.c's own
+ * word-wrap produces reasonably-filled lines) rather than a measured
+ * exact fit. */
+static void browser_natural_size(int *out_w, int *out_h) {
+	int cw = gfx_char_width(), ch = gfx_char_height();
+	*out_w = 80 * cw + 2 * PADDING;
+	*out_h = 26 * (ch + 4) + 2 * PADDING;
+}
+
 static void paint_browser(struct window *w) {
 	int idx = (int)(w - windows);
 	struct browser_state *st = &browser[idx];
@@ -591,7 +913,7 @@ static void key_browser(struct window *w, char c) {
 	else if (c == KEY_ARROW_DOWN) { st->scroll++; }
 }
 
-static int create_window(int x, int y, int w, int h, const char *title, window_paint_fn paint, window_key_fn key, gfx_color_t accent) {
+static int create_window(int x, int y, int w, int h, const char *title, window_paint_fn paint, window_key_fn key, window_click_fn click, gfx_color_t accent) {
 	for (int i = 0; i < MAX_WINDOWS; i++) {
 		if (!windows[i].used) {
 			windows[i].used = true;
@@ -601,6 +923,7 @@ static int create_window(int x, int y, int w, int h, const char *title, window_p
 			windows[i].h = h;
 			windows[i].paint = paint;
 			windows[i].key = key;
+			windows[i].click = click;
 			windows[i].counter = 0;
 			windows[i].accent = accent;
 			windows[i].minimized = false;
@@ -619,9 +942,12 @@ static int create_window(int x, int y, int w, int h, const char *title, window_p
  * only being able to find windows that already happen to be open. */
 struct app_entry {
 	const char *name;
-	int x_offset, y_offset, w, h;
+	int x_offset, y_offset, w, h; /* w/h are a fallback minimum, used as-is only when natural_size is NULL */
 	window_paint_fn paint;
 	window_key_fn key; /* NULL for apps with no keyboard interaction (About, Uptime, Palette) */
+	window_click_fn click; /* NULL for apps with no content-area click interaction */
+	window_natural_size_fn natural_size; /* NULL to just use w/h as given */
+	enum app_icon icon;
 	gfx_color_t accent;
 	/* Console apps (Terminal) aren't drawn as a window at all - they
 	 * take over the whole screen via the software console the same way
@@ -636,19 +962,25 @@ static struct app_entry apps[MAX_APPS];
 static int app_count = 0;
 static int base_cx, base_cy;
 
-static void register_app(const char *name, int x_offset, int y_offset, int w, int h, window_paint_fn paint, gfx_color_t accent) {
+static void register_app(const char *name, int x_offset, int y_offset, int w, int h, window_paint_fn paint, window_natural_size_fn natural_size, enum app_icon icon, gfx_color_t accent) {
 	if (app_count >= MAX_APPS) return;
-	apps[app_count++] = (struct app_entry){ name, x_offset, y_offset, w, h, paint, NULL, accent, false };
+	apps[app_count++] = (struct app_entry){
+		.name = name, .x_offset = x_offset, .y_offset = y_offset, .w = w, .h = h,
+		.paint = paint, .natural_size = natural_size, .icon = icon, .accent = accent,
+	};
 }
 
-static void register_interactive_app(const char *name, int x_offset, int y_offset, int w, int h, window_paint_fn paint, window_key_fn key, gfx_color_t accent) {
+static void register_interactive_app(const char *name, int x_offset, int y_offset, int w, int h, window_paint_fn paint, window_key_fn key, window_click_fn click, window_natural_size_fn natural_size, enum app_icon icon, gfx_color_t accent) {
 	if (app_count >= MAX_APPS) return;
-	apps[app_count++] = (struct app_entry){ name, x_offset, y_offset, w, h, paint, key, accent, false };
+	apps[app_count++] = (struct app_entry){
+		.name = name, .x_offset = x_offset, .y_offset = y_offset, .w = w, .h = h,
+		.paint = paint, .key = key, .click = click, .natural_size = natural_size, .icon = icon, .accent = accent,
+	};
 }
 
-static void register_console_app(const char *name) {
+static void register_console_app(const char *name, enum app_icon icon) {
 	if (app_count >= MAX_APPS) return;
-	apps[app_count++] = (struct app_entry){ name, 0, 0, 0, 0, NULL, NULL, 0, true };
+	apps[app_count++] = (struct app_entry){ .name = name, .icon = icon, .is_console_app = true };
 }
 
 static int find_open_window_by_name(const char *name) {
@@ -656,6 +988,46 @@ static int find_open_window_by_name(const char *name) {
 		if (windows[i].used && strcmp(windows[i].title, name) == 0) return i;
 	}
 	return -1;
+}
+
+/* Recomputes every currently-open window's size from its app's
+ * natural_size function (see window_natural_size_fn's comment) and
+ * resizes it in place, anchored at its current top-left corner -
+ * called right after a UI-scale change (Settings' "UI Scale"
+ * dropdown), since every app's fixed chrome text needs more or fewer
+ * pixels at the new font scale to still fit without clipping.
+ * Fullscreen windows are left as fullscreen (still covering the
+ * screen); their saved restore_w/restore_h is updated instead, so
+ * un-maximizing later restores to the newly correct size rather than
+ * the old scale's. Windows are also nudged back on-screen if resizing
+ * would otherwise push them past the screen edge. */
+static void rescale_all_windows(void) {
+	for (int i = 0; i < MAX_WINDOWS; i++) {
+		struct window *w = &windows[i];
+		if (!w->used) continue;
+
+		window_natural_size_fn natural_size = NULL;
+		for (int a = 0; a < app_count; a++) {
+			if (strcmp(apps[a].name, w->title) == 0) { natural_size = apps[a].natural_size; break; }
+		}
+		if (!natural_size) continue;
+
+		int new_w, new_h;
+		natural_size(&new_w, &new_h);
+
+		if (w->fullscreen) {
+			w->restore_w = new_w;
+			w->restore_h = new_h;
+			continue;
+		}
+
+		w->w = new_w;
+		w->h = new_h;
+		if (w->x + new_w > screen_w) w->x = screen_w - new_w;
+		if (w->x < 0) w->x = 0;
+		if (w->y + new_h + TITLEBAR_H > screen_h - TASKBAR_H) w->y = screen_h - TASKBAR_H - new_h - TITLEBAR_H;
+		if (w->y < 0) w->y = 0;
+	}
 }
 
 static void run_console_app(void (*entry)(void)) {
@@ -677,7 +1049,10 @@ static void run_console_app(void (*entry)(void)) {
 static void window_opened(int idx, const char *app_name) {
 	if (strcmp(app_name, "Settings") == 0) {
 		settings_selected[idx] = timezone_find_closest_option(rtc_get_timezone_offset_minutes());
+		settings_scale_selected[idx] = ui_scale_find_option(gfx_font_scale());
 		settings_applied[idx] = false;
+		settings_open[idx] = SETTINGS_DROPDOWN_NONE;
+		settings_dropdown_scroll[idx] = 0;
 	} else if (strcmp(app_name, "Text Editor") == 0) {
 		memset(&texteditor[idx], 0, sizeof(texteditor[idx]));
 		texteditor[idx].picking_filename = true;
@@ -700,7 +1075,9 @@ static void launch_or_focus_app(int app_index) {
 
 	int idx = find_open_window_by_name(app->name);
 	if (idx < 0) {
-		idx = create_window(base_cx + app->x_offset, base_cy + app->y_offset, app->w, app->h, app->name, app->paint, app->key, app->accent);
+		int w = app->w, h = app->h;
+		if (app->natural_size) app->natural_size(&w, &h);
+		idx = create_window(base_cx + app->x_offset, base_cy + app->y_offset, w, h, app->name, app->paint, app->key, app->click, app->accent);
 		if (idx >= 0) window_opened(idx, app->name); /* let a freshly created window initialize its own per-window state */
 	}
 	if (idx >= 0) {
@@ -723,13 +1100,13 @@ void wm_init(void) {
 	base_cx = screen_w / 2 - 340;
 	base_cy = screen_h / 2 - 230;
 
-	register_app("About auroraOS", 0, 0, 500, 320, paint_about, COL_ACCENT);
-	register_app("Uptime", 540, 0, 280, 190, paint_counter, GFX_RGB(0x28, 0xC8, 0x40));
-	register_app("Palette", 100, 290, 320, 160, paint_palette, GFX_RGB(0xB1, 0x8C, 0xFF));
-	register_interactive_app("Settings", 100, 40, 380, 330, paint_settings, key_settings, GFX_RGB(0x4D, 0xD0, 0xC7));
-	register_interactive_app("Text Editor", 40, 20, 520, 400, paint_texteditor, key_texteditor, COL_ACCENT);
-	register_interactive_app("Browser", 30, 10, 640, 460, paint_browser, key_browser, GFX_RGB(0xFF, 0x8A, 0x3D));
-	register_console_app("Terminal");
+	register_app("About auroraOS", 0, 0, 500, 320, paint_about, about_natural_size, ICON_INFO, COL_ACCENT);
+	register_app("Uptime", 540, 0, 280, 190, paint_counter, counter_natural_size, ICON_CLOCK, GFX_RGB(0x28, 0xC8, 0x40));
+	register_app("Palette", 100, 290, 320, 160, paint_palette, palette_natural_size, ICON_PALETTE, GFX_RGB(0xB1, 0x8C, 0xFF));
+	register_interactive_app("Settings", 100, 40, 380, 330, paint_settings, key_settings, click_settings, settings_natural_size, ICON_GEAR, GFX_RGB(0x4D, 0xD0, 0xC7));
+	register_interactive_app("Text Editor", 40, 20, 520, 400, paint_texteditor, key_texteditor, NULL, texteditor_natural_size, ICON_DOCUMENT, COL_ACCENT);
+	register_interactive_app("Browser", 30, 10, 640, 460, paint_browser, key_browser, NULL, browser_natural_size, ICON_GLOBE, GFX_RGB(0xFF, 0x8A, 0x3D));
+	register_console_app("Terminal", ICON_TERMINAL);
 
 	/* Apps are registered so search/the taskbar can find them, but none
 	 * are opened automatically - the desktop boots to an empty screen,
@@ -738,6 +1115,91 @@ void wm_init(void) {
 
 static void draw_titlebar_button(int x, int y, gfx_color_t color) {
 	gfx_fill_round_rect(x, y, 12, 12, 6, color);
+}
+
+/* Draws one app's icon glyph inside the (x, y, size, size) box, in
+ * `color` (each call site picks the app's own accent, same as the old
+ * flat-swatch behavior, just shaped now instead of a plain square).
+ * Deliberately simple, chunky shapes built only from this file's
+ * existing gfx_fill_rect/gfx_fill_round_rect/gfx_draw_line primitives
+ * (a filled circle is just gfx_fill_round_rect with radius = size/2)
+ * - legible at the small sizes these actually render at (14px in the
+ * search list, similar in a future taskbar icon slot), not detailed
+ * icon art. */
+static void draw_app_icon(int x, int y, int size, enum app_icon icon, gfx_color_t color) {
+	switch (icon) {
+		case ICON_INFO: {
+			int r = size / 2;
+			gfx_fill_round_rect(x, y, size, size, r, color);
+			int dot_size = size / 6 > 0 ? size / 6 : 1;
+			gfx_fill_rect(x + r - dot_size / 2, y + size / 5, dot_size, dot_size, COL_WIN_BODY);
+			gfx_fill_rect(x + r - dot_size / 2, y + size / 2 - dot_size / 2, dot_size, size / 3, COL_WIN_BODY);
+			break;
+		}
+		case ICON_CLOCK: {
+			int r = size / 2;
+			gfx_fill_round_rect(x, y, size, size, r, color);
+			int cx = x + r, cy = y + r;
+			gfx_draw_line(cx, cy, cx, y + size / 5, COL_WIN_BODY);       /* minute hand, pointing up */
+			gfx_draw_line(cx, cy, x + size * 2 / 3, cy, COL_WIN_BODY);   /* hour hand, pointing right */
+			break;
+		}
+		case ICON_PALETTE: {
+			int r = size / 2;
+			gfx_fill_round_rect(x, y, size, size, r, color);
+			int dot = size / 5 > 1 ? size / 5 : 2;
+			gfx_fill_round_rect(x + size / 4 - dot / 2, y + size / 4 - dot / 2, dot, dot, dot / 2, GFX_RGB(0xFF, 0x5F, 0x57));
+			gfx_fill_round_rect(x + size * 3 / 4 - dot / 2, y + size / 4 - dot / 2, dot, dot, dot / 2, GFX_RGB(0x28, 0xC8, 0x40));
+			gfx_fill_round_rect(x + size / 2 - dot / 2, y + size * 3 / 4 - dot / 2, dot, dot, dot / 2, GFX_RGB(0x5B, 0x9C, 0xFF));
+			break;
+		}
+		case ICON_GEAR: {
+			int r = size / 2;
+			int cx = x + r, cy = y + r;
+			/* four teeth: small squares at N/S/E/W around a central ring */
+			int tooth = size / 4 > 1 ? size / 4 : 1;
+			gfx_fill_rect(cx - tooth / 2, y, tooth, tooth, color);
+			gfx_fill_rect(cx - tooth / 2, y + size - tooth, tooth, tooth, color);
+			gfx_fill_rect(x, cy - tooth / 2, tooth, tooth, color);
+			gfx_fill_rect(x + size - tooth, cy - tooth / 2, tooth, tooth, color);
+			gfx_fill_round_rect(x + size / 5, y + size / 5, size * 3 / 5, size * 3 / 5, size * 3 / 10, color);
+			int hole = size / 4 > 1 ? size / 4 : 1;
+			gfx_fill_round_rect(cx - hole / 2, cy - hole / 2, hole, hole, hole / 2, COL_WIN_BODY);
+			break;
+		}
+		case ICON_DOCUMENT: {
+			int fold = size / 3;
+			gfx_fill_round_rect(x, y, size, size, 3, color);
+			gfx_fill_rect(x + size - fold, y, fold, fold, COL_WIN_BODY); /* dog-eared corner cutout */
+			int line_y = y + size / 2;
+			for (int i = 0; i < 3; i++) {
+				gfx_fill_rect(x + size / 5, line_y + i * (size / 6), size * 3 / 5, 1, COL_WIN_BODY);
+			}
+			break;
+		}
+		case ICON_GLOBE: {
+			int r = size / 2;
+			int cx = x + r, cy = y + r;
+			gfx_fill_round_rect(x, y, size, size, r, color);
+			gfx_fill_rect(x, cy, size, 1, COL_WIN_BODY); /* equator */
+			gfx_fill_rect(cx, y, 1, size, COL_WIN_BODY); /* prime meridian */
+			gfx_draw_line(x + size / 6, y + size / 4, x + size * 5 / 6, y + size / 4, COL_WIN_BODY);
+			gfx_draw_line(x + size / 6, y + size * 3 / 4, x + size * 5 / 6, y + size * 3 / 4, COL_WIN_BODY);
+			break;
+		}
+		case ICON_TERMINAL: {
+			gfx_fill_round_rect(x, y, size, size, 3, color);
+			int py = y + size / 3;
+			gfx_draw_line(x + size / 5, py, x + size / 2, y + size / 2, COL_WIN_BODY);
+			gfx_draw_line(x + size / 5, py + size / 3, x + size / 2, y + size / 2, COL_WIN_BODY);
+			gfx_fill_rect(x + size / 2, y + size * 2 / 3, size / 3, 1, COL_WIN_BODY);
+			break;
+		}
+		case ICON_NONE:
+		default:
+			gfx_fill_round_rect(x, y, size, size, 4, color);
+			break;
+	}
 }
 
 static void toggle_fullscreen(struct window *w) {
@@ -965,19 +1427,28 @@ static void draw_taskbar(void) {
 		int idx = window_order[i];
 		struct window *w = &windows[idx];
 		if (!w->used) continue;
-		int tw = gfx_string_width(w->title) + 32;
+
+		enum app_icon icon = ICON_NONE;
+		for (int a = 0; a < app_count; a++) {
+			if (strcmp(apps[a].name, w->title) == 0) { icon = apps[a].icon; break; }
+		}
+
+		int icon_size = TASKBAR_H - 26;
+		int tw = gfx_string_width(w->title) + 32 + icon_size + 6;
 		if (bx + tw > bx_max) break; /* out of room; skip remaining buttons */
 		bool active = (idx == topmost);
 		gfx_color_t text_color = w->minimized ? COL_TEXT_DIM : (active ? COL_TEXT : COL_TEXT_DIM);
 		gfx_fill_round_rect(bx, y + 8, tw, TASKBAR_H - 16, 8,
 			active ? COL_TASKBAR_ACTIVE : (w->minimized ? GFX_RGB(0x15, 0x17, 0x22) : GFX_RGB(0x1C, 0x1F, 0x2C)));
 		if (active) gfx_fill_rect(bx + 8, y + TASKBAR_H - 6, tw - 16, 2, w->accent);
+		draw_app_icon(bx + 12, y + (TASKBAR_H - icon_size) / 2, icon_size, icon, w->accent);
+		int text_x = bx + 12 + icon_size + 6;
 		if (w->minimized) {
 			/* small dash icon hints "this is minimized, click to restore" */
-			gfx_fill_rect(bx + 8, y + TASKBAR_H / 2 - 1, 8, 2, COL_TEXT_DIM);
-			gfx_draw_string(bx + 22, y + (TASKBAR_H - gfx_char_height()) / 2, w->title, text_color);
+			gfx_fill_rect(text_x, y + TASKBAR_H / 2 - 1, 8, 2, COL_TEXT_DIM);
+			gfx_draw_string(text_x + 14, y + (TASKBAR_H - gfx_char_height()) / 2, w->title, text_color);
 		} else {
-			gfx_draw_string(bx + 16, y + (TASKBAR_H - gfx_char_height()) / 2, w->title, text_color);
+			gfx_draw_string(text_x, y + (TASKBAR_H - gfx_char_height()) / 2, w->title, text_color);
 		}
 
 		if (taskbar_button_count < MAX_WINDOWS) {
@@ -1049,7 +1520,7 @@ static void draw_search_panel(void) {
 			gfx_fill_round_rect(field_x, row_y, field_w, SEARCH_ROW_H - 4, 6, COL_TASKBAR_ACTIVE);
 		}
 		struct app_entry *app = &apps[matches[i]];
-		gfx_fill_round_rect(field_x + 8, row_y + (SEARCH_ROW_H - 4 - 14) / 2, 14, 14, 4, app->accent);
+		draw_app_icon(field_x + 8, row_y + (SEARCH_ROW_H - 4 - 14) / 2, 14, app->icon, app->accent);
 		gfx_draw_string(field_x + 32, row_y + (SEARCH_ROW_H - 4 - gfx_char_height()) / 2, app->name, selected ? COL_TEXT : COL_TEXT_DIM);
 		row_y += SEARCH_ROW_H;
 	}
@@ -1396,7 +1867,10 @@ static void handle_click(int x, int y) {
 		dragging_window = idx;
 		drag_offset_x = x - w->x;
 		drag_offset_y = y - w->y;
+		return;
 	}
+
+	if (w->click) w->click(w, x - w->x, y - w->y);
 }
 
 void wm_run(void) {

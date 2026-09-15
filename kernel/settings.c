@@ -67,3 +67,40 @@ int timezone_find_closest_option(int offset_minutes) {
 	}
 	return best;
 }
+
+/* Second (and so far last) setting: UI scale. There's no real video-
+ * mode-switching driver here (the framebuffer resolution is fixed at
+ * boot by whatever VBE mode GRUB requested - see gfx.c's file
+ * comment), so a genuine "resolution" setting that changes actual
+ * hardware pixel dimensions isn't feasible without a lot more work (a
+ * real-mode VESA BIOS call or GOP runtime switch). This is the honest
+ * stand-in: it scales the whole desktop's font/UI metrics (via
+ * gfx_set_font_scale(), which every text and window-sizing
+ * measurement in wm.c already derives from), which is a real and
+ * useful "make everything bigger/smaller" control even though it
+ * isn't literally switching video modes. Same session-only, reset-at-
+ * every-boot scoping as the timezone setting above (see rtc.c's
+ * timezone_offset_minutes) - no persistent settings storage exists in
+ * this kernel yet. */
+static const struct ui_scale_option ui_scale_options[] = {
+	{ "Small", 1 },
+	{ "Medium (default)", 2 },
+	{ "Large", 3 },
+};
+#define UI_SCALE_OPTION_COUNT_VALUE (int)(sizeof(ui_scale_options) / sizeof(ui_scale_options[0]))
+
+int ui_scale_option_count(void) {
+	return UI_SCALE_OPTION_COUNT_VALUE;
+}
+
+const struct ui_scale_option *ui_scale_option_get(int index) {
+	if (index < 0 || index >= UI_SCALE_OPTION_COUNT_VALUE) return NULL;
+	return &ui_scale_options[index];
+}
+
+int ui_scale_find_option(int scale) {
+	for (int i = 0; i < UI_SCALE_OPTION_COUNT_VALUE; i++) {
+		if (ui_scale_options[i].scale == scale) return i;
+	}
+	return 1; /* "Medium (default)" */
+}

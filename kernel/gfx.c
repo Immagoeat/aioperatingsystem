@@ -199,6 +199,8 @@ void gfx_set_font_scale(int scale) {
 	glyph_scale = scale < 1 ? 1 : scale;
 }
 
+int gfx_font_scale(void) { return glyph_scale; }
+
 void gfx_draw_char(int x, int y, char c, gfx_color_t fg) {
 	const uint8_t *glyph = font8x8_get_glyph(c);
 	int size = 8 * glyph_scale;
