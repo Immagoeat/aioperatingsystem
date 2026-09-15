@@ -465,6 +465,13 @@ void mouse_install(void);
 void mouse_set_bounds(int w, int h);
 void mouse_get_state(int *x, int *y, uint8_t *buttons);
 bool mouse_poll_dirty(void);
+/* Real scroll-wheel input (IntelliMouse extension - see mouse.c's
+ * file comment) if the device supports it; always 0 on hardware that
+ * doesn't. Positive = scrolled down/toward the user, negative = up,
+ * matching the sign real IntelliMouse hardware sends. Consumes the
+ * accumulated delta on read (like mouse_poll_dirty()'s edge-triggered
+ * flag), so callers should read it once per frame, not per pixel. */
+int mouse_get_wheel_delta(void);
 
 /* --- font8x8.c --- */
 const uint8_t *font8x8_get_glyph(char c);

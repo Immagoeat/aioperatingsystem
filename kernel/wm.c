@@ -68,6 +68,18 @@ typedef void (*window_key_fn)(struct window *w, char c);
  * had a chance to claim the click first. */
 typedef void (*window_click_fn)(struct window *w, int x, int y);
 
+/* Per-window scroll-wheel input (see mouse.c's IntelliMouse support).
+ * `x`/`y` are window-relative, same convention as window_click_fn, so
+ * an app that has more than one scrollable area (Settings' two
+ * dropdowns) can tell which one the cursor was over; `delta` is the
+ * raw wheel value from mouse_get_wheel_delta() (positive = scrolled
+ * down/toward the user), left for each app to scale/clamp as makes
+ * sense for its own content instead of this dispatcher guessing a
+ * "lines per tick" that fits every app. Dispatched every frame the
+ * wheel actually moved, to whichever window is topmost under the
+ * cursor - see wm_run(). */
+typedef void (*window_scroll_fn)(struct window *w, int x, int y, int delta);
+
 /* Computes an app's minimum content size from its actual text/layout
  * at the current font scale (gfx_char_width()/height()), instead of a
  * fixed pixel constant tuned by eye for one scale - the same window
@@ -85,6 +97,7 @@ struct window {
 	window_paint_fn paint;
 	window_key_fn key; /* NULL for apps with no keyboard interaction */
 	window_click_fn click; /* NULL for apps with no content-area click interaction */
+	window_scroll_fn scroll; /* NULL for apps with no scroll-wheel interaction */
 	int counter;
 	gfx_color_t accent;
 
@@ -465,6 +478,27 @@ static void key_settings(struct window *w, char c) {
 		}
 		settings_open[idx] = SETTINGS_DROPDOWN_NONE;
 	}
+}
+
+/* Scrolling moves which options are visible, independent of which one
+ * is currently selected - the standard dropdown behavior (you scroll
+ * to bring an option into view, then click it to actually select it;
+ * scrolling itself never changes the selection, unlike the arrow keys
+ * in key_settings() above which move the selection and only drag the
+ * visible window along as a side effect). No-op while the dropdown is
+ * closed - nothing to scroll. */
+static void scroll_settings(struct window *w, int x, int y, int delta) {
+	int idx = (int)(w - windows);
+	(void)x; (void)y;
+	if (settings_open[idx] == SETTINGS_DROPDOWN_NONE) return;
+
+	int count = settings_open[idx] == SETTINGS_DROPDOWN_TIMEZONE ? timezone_option_count() : ui_scale_option_count();
+	int max_scroll = count - SETTINGS_DROPDOWN_VISIBLE_ROWS;
+	if (max_scroll < 0) max_scroll = 0;
+
+	settings_dropdown_scroll[idx] += delta > 0 ? 1 : -1;
+	if (settings_dropdown_scroll[idx] < 0) settings_dropdown_scroll[idx] = 0;
+	if (settings_dropdown_scroll[idx] > max_scroll) settings_dropdown_scroll[idx] = max_scroll;
 }
 
 static void click_settings(struct window *w, int x, int y) {
@@ -913,7 +947,23 @@ static void key_browser(struct window *w, char c) {
 	else if (c == KEY_ARROW_DOWN) { st->scroll++; }
 }
 
-static int create_window(int x, int y, int w, int h, const char *title, window_paint_fn paint, window_key_fn key, window_click_fn click, gfx_color_t accent) {
+/* paint_browser() already clamps st->scroll into [0, line_count -
+ * max_visible] every frame, so scrolling past either end here is
+ * harmless - same reasoning as key_browser()'s plain st->scroll++
+ * above with no upper-bound check. Ignores wheel events while the
+ * address bar has focus, matching key_browser()'s own early return
+ * for that case. */
+static void scroll_browser(struct window *w, int x, int y, int delta) {
+	int idx = (int)(w - windows);
+	struct browser_state *st = &browser[idx];
+	(void)x; (void)y;
+	if (st->editing_url) return;
+
+	st->scroll += delta > 0 ? 3 : -3; /* a few lines per tick reads better than one - matches the "one wheel click moves a few rows" feel real scrollable lists have */
+	if (st->scroll < 0) st->scroll = 0;
+}
+
+static int create_window(int x, int y, int w, int h, const char *title, window_paint_fn paint, window_key_fn key, window_click_fn click, window_scroll_fn scroll, gfx_color_t accent) {
 	for (int i = 0; i < MAX_WINDOWS; i++) {
 		if (!windows[i].used) {
 			windows[i].used = true;
@@ -924,6 +974,7 @@ static int create_window(int x, int y, int w, int h, const char *title, window_p
 			windows[i].paint = paint;
 			windows[i].key = key;
 			windows[i].click = click;
+			windows[i].scroll = scroll;
 			windows[i].counter = 0;
 			windows[i].accent = accent;
 			windows[i].minimized = false;
@@ -946,6 +997,7 @@ struct app_entry {
 	window_paint_fn paint;
 	window_key_fn key; /* NULL for apps with no keyboard interaction (About, Uptime, Palette) */
 	window_click_fn click; /* NULL for apps with no content-area click interaction */
+	window_scroll_fn scroll; /* NULL for apps with no scroll-wheel interaction */
 	window_natural_size_fn natural_size; /* NULL to just use w/h as given */
 	enum app_icon icon;
 	gfx_color_t accent;
@@ -970,11 +1022,11 @@ static void register_app(const char *name, int x_offset, int y_offset, int w, in
 	};
 }
 
-static void register_interactive_app(const char *name, int x_offset, int y_offset, int w, int h, window_paint_fn paint, window_key_fn key, window_click_fn click, window_natural_size_fn natural_size, enum app_icon icon, gfx_color_t accent) {
+static void register_interactive_app(const char *name, int x_offset, int y_offset, int w, int h, window_paint_fn paint, window_key_fn key, window_click_fn click, window_scroll_fn scroll, window_natural_size_fn natural_size, enum app_icon icon, gfx_color_t accent) {
 	if (app_count >= MAX_APPS) return;
 	apps[app_count++] = (struct app_entry){
 		.name = name, .x_offset = x_offset, .y_offset = y_offset, .w = w, .h = h,
-		.paint = paint, .key = key, .click = click, .natural_size = natural_size, .icon = icon, .accent = accent,
+		.paint = paint, .key = key, .click = click, .scroll = scroll, .natural_size = natural_size, .icon = icon, .accent = accent,
 	};
 }
 
@@ -1077,7 +1129,7 @@ static void launch_or_focus_app(int app_index) {
 	if (idx < 0) {
 		int w = app->w, h = app->h;
 		if (app->natural_size) app->natural_size(&w, &h);
-		idx = create_window(base_cx + app->x_offset, base_cy + app->y_offset, w, h, app->name, app->paint, app->key, app->click, app->accent);
+		idx = create_window(base_cx + app->x_offset, base_cy + app->y_offset, w, h, app->name, app->paint, app->key, app->click, app->scroll, app->accent);
 		if (idx >= 0) window_opened(idx, app->name); /* let a freshly created window initialize its own per-window state */
 	}
 	if (idx >= 0) {
@@ -1103,9 +1155,9 @@ void wm_init(void) {
 	register_app("About auroraOS", 0, 0, 500, 320, paint_about, about_natural_size, ICON_INFO, COL_ACCENT);
 	register_app("Uptime", 540, 0, 280, 190, paint_counter, counter_natural_size, ICON_CLOCK, GFX_RGB(0x28, 0xC8, 0x40));
 	register_app("Palette", 100, 290, 320, 160, paint_palette, palette_natural_size, ICON_PALETTE, GFX_RGB(0xB1, 0x8C, 0xFF));
-	register_interactive_app("Settings", 100, 40, 380, 330, paint_settings, key_settings, click_settings, settings_natural_size, ICON_GEAR, GFX_RGB(0x4D, 0xD0, 0xC7));
-	register_interactive_app("Text Editor", 40, 20, 520, 400, paint_texteditor, key_texteditor, NULL, texteditor_natural_size, ICON_DOCUMENT, COL_ACCENT);
-	register_interactive_app("Browser", 30, 10, 640, 460, paint_browser, key_browser, NULL, browser_natural_size, ICON_GLOBE, GFX_RGB(0xFF, 0x8A, 0x3D));
+	register_interactive_app("Settings", 100, 40, 380, 330, paint_settings, key_settings, click_settings, scroll_settings, settings_natural_size, ICON_GEAR, GFX_RGB(0x4D, 0xD0, 0xC7));
+	register_interactive_app("Text Editor", 40, 20, 520, 400, paint_texteditor, key_texteditor, NULL, NULL, texteditor_natural_size, ICON_DOCUMENT, COL_ACCENT);
+	register_interactive_app("Browser", 30, 10, 640, 460, paint_browser, key_browser, NULL, scroll_browser, browser_natural_size, ICON_GLOBE, GFX_RGB(0xFF, 0x8A, 0x3D));
 	register_console_app("Terminal", ICON_TERMINAL);
 
 	/* Apps are registered so search/the taskbar can find them, but none
@@ -1888,6 +1940,17 @@ void wm_run(void) {
 			handle_click(mx, my);
 		} else if (!button_down) {
 			dragging_window = -1;
+		}
+
+		int wheel_delta = mouse_get_wheel_delta();
+		if (wheel_delta != 0) {
+			int idx = topmost_window_at(mx, my);
+			if (idx >= 0) {
+				struct window *w = &windows[idx];
+				if (w->scroll && my >= w->y + TITLEBAR_H) {
+					w->scroll(w, mx - w->x, my - w->y, wheel_delta);
+				}
+			}
 		}
 
 		if (dragging_window >= 0 && button_down) {
