@@ -43,6 +43,15 @@ void *memcpy(void *dst, const void *src, size_t n) {
 	return dst;
 }
 
+int memcmp(const void *a, const void *b, size_t n) {
+	const unsigned char *pa = a, *pb = b;
+	while (n--) {
+		if (*pa != *pb) return (int)*pa - (int)*pb;
+		pa++; pb++;
+	}
+	return 0;
+}
+
 /* Unlike memcpy, safe when src/dst overlap: copies backward-to-forward
  * (highest address first) when dst comes after src in memory, so a
  * byte isn't overwritten before it's been read - the standard

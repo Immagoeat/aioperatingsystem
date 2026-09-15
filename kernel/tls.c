@@ -1,18 +1,24 @@
 /* tls.c - a real (if narrowly scoped) TLS 1.2 client, built on the
- * primitives verified independently in bignum.c/rsa.c/aes.c/hmac.c and
- * the certificate parsing in x509.c.
+ * primitives verified independently in bignum.c/rsa.c/aes.c/hmac.c/
+ * ecc.c and the certificate parsing in x509.c.
  *
- * Cipher suite: TLS_RSA_WITH_AES_128_CBC_SHA256 only. This is
- * deliberately the oldest/simplest real TLS 1.2 mode - RSA key
- * exchange (no elliptic-curve math needed) and AES-CBC (no Galois-
- * field authenticated-encryption math needed) - chosen because it's
- * more tractable to hand-implement and verify correctly than
- * ECDHE+AES-GCM, at the real cost that many modern servers now refuse
- * it as too old (see the file comment in kernel.h's tls_connect()
- * declaration). This will work against servers that still allow it -
- * older infrastructure, test/embedded targets, badssl.com's own
- * legacy-cipher test subdomains - and correctly fail (not silently
- * downgrade to something insecure) against ones that don't.
+ * Two cipher suites, both AES-128-CBC + HMAC-SHA256 for the actual
+ * record protection (no Galois-field authenticated-encryption math
+ * needed - AES-GCM is out of scope, same reasoning as before), but
+ * now with a real choice of key exchange:
+ *
+ *   - TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256 (P-256, RFC 4492/8422):
+ *     offered first/preferred, and what most real HTTPS sites
+ *     actually negotiate today. Forward-secret ephemeral key exchange,
+ *     authenticated by the server's RSA signature over its ephemeral
+ *     key (checked - see rsa_verify_pkcs1_sha256() in rsa.c).
+ *   - TLS_RSA_WITH_AES_128_CBC_SHA256: the original, simpler suite
+ *     this client started with - no elliptic-curve math, no forward
+ *     secrecy, offered second as a fallback for servers that don't
+ *     support ECDHE (older infrastructure, test/embedded targets).
+ *
+ * Either way this client correctly fails (not silently downgrades to
+ * something insecure) against a server that supports neither.
  *
  * Certificate handling: extracts a real RSA public key from the
  * server's certificate (x509.c) and checks the certificate's subject
@@ -76,12 +82,28 @@ static const char *tls_alert_name(uint8_t description) {
 #define TLS_HANDSHAKE_CLIENT_HELLO         1
 #define TLS_HANDSHAKE_SERVER_HELLO         2
 #define TLS_HANDSHAKE_CERTIFICATE          11
+#define TLS_HANDSHAKE_SERVER_KEY_EXCHANGE  12
 #define TLS_HANDSHAKE_SERVER_HELLO_DONE    14
 #define TLS_HANDSHAKE_CLIENT_KEY_EXCHANGE  16
 #define TLS_HANDSHAKE_FINISHED             20
 
 #define TLS_VERSION_1_2 0x0303
 
+/* Two cipher suites are offered, both ending up at the same AES-128-
+ * CBC + HMAC-SHA256 record protection - see this file's top comment
+ * for why AES-CBC/SHA256 rather than a GCM/AEAD suite. The difference
+ * is entirely in key exchange: TLS_RSA_* (below) sends the pre-master
+ * secret RSA-encrypted directly to the server (works with any RSA
+ * cert, but no forward secrecy, and a growing number of real servers
+ * have dropped support for it); TLS_ECDHE_RSA_* (P-256, RFC 4492/8422)
+ * does an ephemeral Diffie-Hellman exchange on the P-256 curve
+ * instead, authenticated by the server's RSA signature over its
+ * ephemeral key (see ecc.c and rsa_verify_pkcs1_sha256() in rsa.c) -
+ * this is what most real HTTPS sites actually negotiate today, and is
+ * offered first/preferred (ClientHello lists it before the RSA suite,
+ * and a server picks whichever of the offered suites it prefers - in
+ * practice this means most real servers will now pick ECDHE). */
+#define TLS_CIPHER_ECDHE_RSA_AES128_CBC_SHA256 0xC027
 #define TLS_CIPHER_RSA_AES128_CBC_SHA256 0x003C
 
 struct tls_conn {
@@ -350,24 +372,57 @@ bool tls_connect(struct tls_ctx *ctx, uint32_t remote_ip, uint16_t port, const c
 	hello[p++] = (uint8_t)(TLS_VERSION_1_2 >> 8); hello[p++] = (uint8_t)(TLS_VERSION_1_2);
 	memcpy(hello + p, tls.client_random, 32); p += 32;
 	hello[p++] = 0x00; /* session ID length: 0, no session resumption */
-	hello[p++] = 0x00; hello[p++] = 0x02; /* cipher suites length: 2 bytes = 1 suite */
+	hello[p++] = 0x00; hello[p++] = 0x04; /* cipher suites length: 2 bytes each, 2 suites */
+	hello[p++] = (uint8_t)(TLS_CIPHER_ECDHE_RSA_AES128_CBC_SHA256 >> 8);
+	hello[p++] = (uint8_t)(TLS_CIPHER_ECDHE_RSA_AES128_CBC_SHA256);
 	hello[p++] = (uint8_t)(TLS_CIPHER_RSA_AES128_CBC_SHA256 >> 8);
 	hello[p++] = (uint8_t)(TLS_CIPHER_RSA_AES128_CBC_SHA256);
 	hello[p++] = 0x01; /* compression methods length: 1 */
 	hello[p++] = 0x00; /* null compression */
+
+	hello[p++] = 0x00; hello[p++] = 0x00; /* extensions length placeholder, filled below */
+	uint32_t ext_len_pos = p - 2;
+
 	/* Server Name Indication (SNI) extension - many real servers (name-
 	 * based virtual hosting) require this to select the right
 	 * certificate at all */
 	uint32_t hostname_len = (uint32_t)strlen(hostname);
 	uint32_t sni_len = 5 + hostname_len;
-	hello[p++] = 0x00; hello[p++] = 0x00; /* extensions length placeholder, filled below */
-	uint32_t ext_len_pos = p - 2;
 	hello[p++] = 0x00; hello[p++] = 0x00; /* extension type: server_name */
 	hello[p++] = (uint8_t)((sni_len) >> 8); hello[p++] = (uint8_t)(sni_len); /* extension data length */
 	hello[p++] = (uint8_t)((hostname_len + 3) >> 8); hello[p++] = (uint8_t)(hostname_len + 3); /* server_name_list length */
 	hello[p++] = 0x00; /* name type: host_name */
 	hello[p++] = (uint8_t)(hostname_len >> 8); hello[p++] = (uint8_t)(hostname_len);
 	memcpy(hello + p, hostname, hostname_len); p += hostname_len;
+
+	/* elliptic_curves/supported_groups (RFC 4492/8422) - required for a
+	 * server to ever pick an ECDHE suite at all; P-256 (named curve 23)
+	 * is the only one this client speaks (see ecc.c). Wire format
+	 * confirmed against a real ClientHello (openssl s_client -msg). */
+	hello[p++] = 0x00; hello[p++] = 0x0A; /* extension type: elliptic_curves */
+	hello[p++] = 0x00; hello[p++] = 0x04; /* extension data length: 4 */
+	hello[p++] = 0x00; hello[p++] = 0x02; /* named curve list length: 2 */
+	hello[p++] = 0x00; hello[p++] = 0x17; /* secp256r1 (P-256) */
+
+	/* ec_point_formats (RFC 4492) - declares this client only accepts
+	 * the uncompressed point format, the only one ecc.c handles. */
+	hello[p++] = 0x00; hello[p++] = 0x0B; /* extension type: ec_point_formats */
+	hello[p++] = 0x00; hello[p++] = 0x02; /* extension data length: 2 */
+	hello[p++] = 0x01; /* point format list length: 1 */
+	hello[p++] = 0x00; /* uncompressed */
+
+	/* signature_algorithms (RFC 5246 7.4.1.4.1) - without this, a
+	 * server is entitled to assume the legacy default (SHA-1+RSA) when
+	 * choosing how to sign ServerKeyExchange, which is exactly what a
+	 * real server (httpbin.org) was observed doing before this
+	 * extension was added - only SHA256+RSA is ever offered here since
+	 * that's the only signature this client can check (see
+	 * rsa_verify_pkcs1_sha256() in rsa.c). */
+	hello[p++] = 0x00; hello[p++] = 0x0D; /* extension type: signature_algorithms */
+	hello[p++] = 0x00; hello[p++] = 0x04; /* extension data length: 4 */
+	hello[p++] = 0x00; hello[p++] = 0x02; /* supported_signature_algorithms list length: 2 */
+	hello[p++] = 0x04; hello[p++] = 0x01; /* hash=SHA256(4), signature=RSA(1) */
+
 	uint32_t extensions_len = p - ext_len_pos - 2;
 	hello[ext_len_pos] = (uint8_t)(extensions_len >> 8);
 	hello[ext_len_pos + 1] = (uint8_t)(extensions_len);
@@ -396,6 +451,9 @@ bool tls_connect(struct tls_ctx *ctx, uint32_t remote_ip, uint16_t port, const c
 
 	struct x509_cert server_cert;
 	bool got_server_hello = false, got_certificate = false, got_server_hello_done = false;
+	bool got_server_key_exchange = false;
+	uint16_t chosen_cipher_suite = 0;
+	uint8_t server_ecdhe_pubkey[65]; /* uncompressed SEC1 point, only filled/used for the ECDHE suite */
 
 	/* Handshake messages can span multiple records or several messages
 	 * can share one record; accumulate into a flight buffer and walk
@@ -440,9 +498,86 @@ bool tls_connect(struct tls_ctx *ctx, uint32_t remote_ip, uint16_t port, const c
 
 			const uint8_t *body = flight + fp + 4;
 			if (msg_type == TLS_HANDSHAKE_SERVER_HELLO) {
-				if (msg_len < 2 + 32) { tcp_close(&tls.tcp); local_strcpy_bounded_tls(out_error, "Malformed ServerHello.", out_error_len); return false; }
+				if (msg_len < 2 + 32 + 1) { tcp_close(&tls.tcp); local_strcpy_bounded_tls(out_error, "Malformed ServerHello.", out_error_len); return false; }
 				memcpy(tls.server_random, body + 2, 32);
+
+				/* version(2) || random(32) || session_id_len(1) ||
+				 * session_id[...] || cipher_suite(2) || ... - walk past
+				 * the variable-length session ID to reach the cipher
+				 * suite the server actually chose (previously never
+				 * checked at all - this client only ever offered one
+				 * suite before ECDHE support existed, so it didn't
+				 * matter yet). */
+				uint32_t sess_id_len = body[34];
+				uint32_t cs_pos = 35 + sess_id_len;
+				if (cs_pos + 2 > msg_len) { tcp_close(&tls.tcp); local_strcpy_bounded_tls(out_error, "Malformed ServerHello.", out_error_len); return false; }
+				chosen_cipher_suite = (uint16_t)(((uint16_t)body[cs_pos] << 8) | body[cs_pos + 1]);
+				if (chosen_cipher_suite != TLS_CIPHER_ECDHE_RSA_AES128_CBC_SHA256 && chosen_cipher_suite != TLS_CIPHER_RSA_AES128_CBC_SHA256) {
+					tcp_close(&tls.tcp);
+					local_strcpy_bounded_tls(out_error, "Server chose a cipher suite this client didn't offer.", out_error_len);
+					return false;
+				}
 				got_server_hello = true;
+			} else if (msg_type == TLS_HANDSHAKE_SERVER_KEY_EXCHANGE) {
+				/* Only sent for the ECDHE suite - RFC 4492/8422 wire
+				 * format: curve_type(1) || named_curve(2) ||
+				 * pubkey_len(1) || pubkey[...] ||
+				 * SignatureAndHashAlgorithm(2) || sig_len(2) ||
+				 * signature[...]. Verified against a real capture
+				 * (openssl s_client -msg against a live ECDHE-RSA
+				 * server) before this parsing was written. */
+				if (msg_len < 1 + 2 + 1) { tcp_close(&tls.tcp); local_strcpy_bounded_tls(out_error, "Malformed ServerKeyExchange.", out_error_len); return false; }
+				uint8_t curve_type = body[0];
+				uint16_t named_curve = (uint16_t)(((uint16_t)body[1] << 8) | body[2]);
+				if (curve_type != 3 || named_curve != 23) {
+					tcp_close(&tls.tcp);
+					local_strcpy_bounded_tls(out_error, "Server's ServerKeyExchange uses an unsupported curve (only P-256 is supported).", out_error_len);
+					return false;
+				}
+				uint8_t pubkey_len = body[3];
+				if (pubkey_len != 65 || 4 + 65u > msg_len) {
+					tcp_close(&tls.tcp);
+					local_strcpy_bounded_tls(out_error, "Malformed ECDHE public key in ServerKeyExchange.", out_error_len);
+					return false;
+				}
+				memcpy(server_ecdhe_pubkey, body + 4, 65);
+
+				uint32_t sig_algo_pos = 4 + 65;
+				if (sig_algo_pos + 4 > msg_len) { tcp_close(&tls.tcp); local_strcpy_bounded_tls(out_error, "Malformed ServerKeyExchange signature header.", out_error_len); return false; }
+				uint8_t hash_algo = body[sig_algo_pos], sig_algo = body[sig_algo_pos + 1];
+				if (hash_algo != 4 || sig_algo != 1) { /* 4=SHA256, 1=RSA - the only combination this client checks against */
+					tcp_close(&tls.tcp);
+					local_strcpy_bounded_tls(out_error, "Server signed ServerKeyExchange with an unsupported hash/signature algorithm.", out_error_len);
+					return false;
+				}
+				uint32_t sig_len = (uint32_t)(((uint32_t)body[sig_algo_pos + 2] << 8) | body[sig_algo_pos + 3]);
+				uint32_t sig_pos = sig_algo_pos + 4;
+				if (sig_pos + sig_len != msg_len) { tcp_close(&tls.tcp); local_strcpy_bounded_tls(out_error, "Malformed ServerKeyExchange signature length.", out_error_len); return false; }
+
+				/* The signed content is client_random || server_random ||
+				 * the ECDHE params exactly as sent on the wire (curve_type
+				 * through the end of the public key) - RFC 8422 SS5.4. */
+				uint8_t signed_content[32 + 32 + 1 + 2 + 1 + 65];
+				memcpy(signed_content, tls.client_random, 32);
+				memcpy(signed_content + 32, tls.server_random, 32);
+				memcpy(signed_content + 64, body, 4 + 65);
+				uint8_t signed_hash[32];
+				sha256(signed_content, sizeof(signed_content), signed_hash);
+
+				if (!got_certificate) {
+					tcp_close(&tls.tcp);
+					local_strcpy_bounded_tls(out_error, "Server sent ServerKeyExchange before its Certificate.", out_error_len);
+					return false;
+				}
+				if (!rsa_verify_pkcs1_sha256(server_cert.pubkey.modulus, server_cert.pubkey.modulus_len,
+				                             server_cert.pubkey.exponent, server_cert.pubkey.exponent_len,
+				                             body + sig_pos, sig_len, signed_hash)) {
+					tcp_close(&tls.tcp);
+					local_strcpy_bounded_tls(out_error, "ServerKeyExchange signature verification failed.", out_error_len);
+					return false;
+				}
+
+				got_server_key_exchange = true;
 			} else if (msg_type == TLS_HANDSHAKE_CERTIFICATE) {
 				/* Certificate message: 3-byte total length, then a list
 				 * of 3-byte-length-prefixed DER certificates - this
@@ -472,6 +607,12 @@ bool tls_connect(struct tls_ctx *ctx, uint32_t remote_ip, uint16_t port, const c
 		tcp_close(&tls.tcp);
 		return false;
 	}
+	bool using_ecdhe = (chosen_cipher_suite == TLS_CIPHER_ECDHE_RSA_AES128_CBC_SHA256);
+	if (using_ecdhe && !got_server_key_exchange) {
+		local_strcpy_bounded_tls(out_error, "Server chose ECDHE but never sent ServerKeyExchange.", out_error_len);
+		tcp_close(&tls.tcp);
+		return false;
+	}
 
 	/* Real, but limited, hostname check - see this file's own top
 	 * comment and x509.c's for exactly what this does and doesn't
@@ -483,35 +624,79 @@ bool tls_connect(struct tls_ctx *ctx, uint32_t remote_ip, uint16_t port, const c
 		return false;
 	}
 
-	/* --- ClientKeyExchange: generate a pre-master secret, RSA-encrypt
-	 * it with the server's public key from its certificate --- */
-	uint8_t pre_master_secret[48];
-	pre_master_secret[0] = (uint8_t)(TLS_VERSION_1_2 >> 8);
-	pre_master_secret[1] = (uint8_t)(TLS_VERSION_1_2);
-	fill_random(pre_master_secret + 2, 46, 0x22222222u);
-
-	static uint8_t encrypted_pms[512];
-	if (!rsa_encrypt_pkcs1(server_cert.pubkey.modulus, server_cert.pubkey.modulus_len,
-	                        server_cert.pubkey.exponent, server_cert.pubkey.exponent_len,
-	                        pre_master_secret, sizeof(pre_master_secret),
-	                        encrypted_pms, server_cert.pubkey.modulus_len)) {
-		local_strcpy_bounded_tls(out_error, "RSA encryption of the pre-master secret failed.", out_error_len);
-		tcp_close(&tls.tcp);
-		return false;
-	}
-
-	uint32_t modulus_len = server_cert.pubkey.modulus_len;
-	uint8_t cke_body[600];
-	cke_body[0] = (uint8_t)(modulus_len >> 8);
-	cke_body[1] = (uint8_t)(modulus_len);
-	memcpy(cke_body + 2, encrypted_pms, modulus_len);
-	uint32_t cke_body_len = 2 + modulus_len;
+	/* --- ClientKeyExchange: derive the pre-master secret, either by
+	 * RSA-encrypting a random value with the server's certificate key
+	 * (TLS_RSA_*) or by an ECDHE exchange on P-256 (TLS_ECDHE_RSA_*) -
+	 * see this file's cipher-suite comment near the top for why both
+	 * exist. Either way, `pre_master_secret`/`pre_master_secret_len`
+	 * end up holding the same thing from here on: the one shared value
+	 * both sides now agree on that everything else (master secret,
+	 * session keys) is derived from. */
+	static uint8_t pre_master_secret[48];
+	uint32_t pre_master_secret_len;
 
 	uint8_t cke_msg[608];
-	cke_msg[0] = TLS_HANDSHAKE_CLIENT_KEY_EXCHANGE;
-	cke_msg[1] = (uint8_t)(cke_body_len >> 16); cke_msg[2] = (uint8_t)(cke_body_len >> 8); cke_msg[3] = (uint8_t)(cke_body_len);
-	memcpy(cke_msg + 4, cke_body, cke_body_len);
-	uint32_t cke_msg_len = 4 + cke_body_len;
+	uint32_t cke_msg_len;
+
+	if (using_ecdhe) {
+		uint8_t ecdhe_seed[32];
+		fill_random(ecdhe_seed, 32, 0x33333333u);
+
+		uint8_t our_private_key[32], our_public_point[65];
+		if (!ecc_p256_generate_keypair(ecdhe_seed, our_private_key, our_public_point)) {
+			local_strcpy_bounded_tls(out_error, "Failed to generate an ECDHE key pair.", out_error_len);
+			tcp_close(&tls.tcp);
+			return false;
+		}
+
+		uint8_t shared_secret[32];
+		if (!ecc_p256_compute_shared_secret(our_private_key, server_ecdhe_pubkey, shared_secret)) {
+			local_strcpy_bounded_tls(out_error, "ECDHE shared secret computation failed (the server's point may not be a valid P-256 point).", out_error_len);
+			tcp_close(&tls.tcp);
+			return false;
+		}
+		memcpy(pre_master_secret, shared_secret, 32);
+		pre_master_secret_len = 32;
+
+		/* ClientKeyExchange for ECDHE (RFC 4492 SS5.7): just our
+		 * uncompressed public point, 1-byte-length-prefixed. */
+		uint8_t cke_body[66];
+		cke_body[0] = 65;
+		memcpy(cke_body + 1, our_public_point, 65);
+		uint32_t cke_body_len = 66;
+
+		cke_msg[0] = TLS_HANDSHAKE_CLIENT_KEY_EXCHANGE;
+		cke_msg[1] = (uint8_t)(cke_body_len >> 16); cke_msg[2] = (uint8_t)(cke_body_len >> 8); cke_msg[3] = (uint8_t)(cke_body_len);
+		memcpy(cke_msg + 4, cke_body, cke_body_len);
+		cke_msg_len = 4 + cke_body_len;
+	} else {
+		pre_master_secret[0] = (uint8_t)(TLS_VERSION_1_2 >> 8);
+		pre_master_secret[1] = (uint8_t)(TLS_VERSION_1_2);
+		fill_random(pre_master_secret + 2, 46, 0x22222222u);
+		pre_master_secret_len = 48;
+
+		static uint8_t encrypted_pms[512];
+		if (!rsa_encrypt_pkcs1(server_cert.pubkey.modulus, server_cert.pubkey.modulus_len,
+		                        server_cert.pubkey.exponent, server_cert.pubkey.exponent_len,
+		                        pre_master_secret, pre_master_secret_len,
+		                        encrypted_pms, server_cert.pubkey.modulus_len)) {
+			local_strcpy_bounded_tls(out_error, "RSA encryption of the pre-master secret failed.", out_error_len);
+			tcp_close(&tls.tcp);
+			return false;
+		}
+
+		uint32_t modulus_len = server_cert.pubkey.modulus_len;
+		uint8_t cke_body[600];
+		cke_body[0] = (uint8_t)(modulus_len >> 8);
+		cke_body[1] = (uint8_t)(modulus_len);
+		memcpy(cke_body + 2, encrypted_pms, modulus_len);
+		uint32_t cke_body_len = 2 + modulus_len;
+
+		cke_msg[0] = TLS_HANDSHAKE_CLIENT_KEY_EXCHANGE;
+		cke_msg[1] = (uint8_t)(cke_body_len >> 16); cke_msg[2] = (uint8_t)(cke_body_len >> 8); cke_msg[3] = (uint8_t)(cke_body_len);
+		memcpy(cke_msg + 4, cke_body, cke_body_len);
+		cke_msg_len = 4 + cke_body_len;
+	}
 
 	transcript_append(&tls, cke_msg, cke_msg_len);
 	if (!tls_send_record(&tls, TLS_CONTENT_HANDSHAKE, cke_msg, cke_msg_len, false)) {
@@ -524,7 +709,7 @@ bool tls_connect(struct tls_ctx *ctx, uint32_t remote_ip, uint16_t port, const c
 	uint8_t seed[64];
 	memcpy(seed, tls.client_random, 32);
 	memcpy(seed + 32, tls.server_random, 32);
-	tls_prf(pre_master_secret, sizeof(pre_master_secret), "master secret", seed, 64, tls.master_secret, sizeof(tls.master_secret));
+	tls_prf(pre_master_secret, pre_master_secret_len, "master secret", seed, 64, tls.master_secret, sizeof(tls.master_secret));
 
 	/* key_block = PRF(master_secret, "key expansion", server_random || client_random, needed_len)
 	 * layout for this cipher suite: client_MAC(32) || server_MAC(32) || client_key(16) || server_key(16)

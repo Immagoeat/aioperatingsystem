@@ -77,17 +77,15 @@ bool tcp_send_segment(struct tcp_conn *conn, uint8_t flags, const void *data, ui
 bool tcp_wait_segment(struct tcp_conn *conn, uint8_t *out_flags, uint8_t *out_data, uint16_t *out_data_len, uint16_t max_data);
 void tcp_close(struct tcp_conn *conn);
 
-/* --- tls.c: a real TLS 1.2 client (TLS_RSA_WITH_AES_128_CBC_SHA256
- * only - the oldest/simplest real TLS 1.2 mode, chosen because it's
- * tractable to hand-implement and verify correctly without elliptic-
- * curve or Galois-field math; many modern servers now refuse this as
- * too old, so this genuinely only works against servers that still
- * allow it). Extracts a real RSA key from the server's certificate and
- * checks the subject name against the hostname, but does NOT validate
- * the certificate's signature against any trusted root CA (no root
- * store exists here) - see tls.c's file comment for exactly what real
- * protection this does and doesn't provide before relying on it for
- * anything sensitive. --- */
+/* --- tls.c: a real TLS 1.2 client, offering TLS_ECDHE_RSA_WITH_
+ * AES_128_CBC_SHA256 (P-256, preferred - what most real HTTPS sites
+ * negotiate) and falling back to TLS_RSA_WITH_AES_128_CBC_SHA256 for
+ * servers that don't support ECDHE. Extracts a real RSA key from the
+ * server's certificate and checks the subject name against the
+ * hostname, but does NOT validate the certificate's signature against
+ * any trusted root CA (no root store exists here) - see tls.c's file
+ * comment for exactly what real protection this does and doesn't
+ * provide before relying on it for anything sensitive. --- */
 struct tls_ctx {
 	void *conn; /* opaque - actually a struct tls_conn*, kept private to tls.c */
 };
@@ -197,6 +195,7 @@ char *strcat(char *dst, const char *src);
 void *memset(void *dst, int val, size_t n);
 void *memcpy(void *dst, const void *src, size_t n);
 void *memmove(void *dst, const void *src, size_t n);
+int memcmp(const void *a, const void *b, size_t n);
 char *strtok_simple(char *str, char delim, char **saveptr);
 
 /* --- printf.c --- */
@@ -261,6 +260,28 @@ bool bignum_modexp_bytes(const uint8_t *message, uint32_t message_len,
                           const uint8_t *modulus, uint32_t modulus_len,
                           uint8_t *out, uint32_t out_len);
 
+/* General-purpose modular add/sub/mul/inverse on byte buffers, over
+ * the same fixed 4096-bit capacity as bignum_modexp_bytes() above -
+ * used by ecc.c for P-256 field arithmetic (RSA only ever needed
+ * modexp; elliptic curve point operations need the rest). Inverse is
+ * computed via Fermat's little theorem, so it's only valid mod a
+ * prime. */
+bool bignum_addmod_bytes(const uint8_t *a, uint32_t a_len, const uint8_t *b, uint32_t b_len,
+                          const uint8_t *modulus, uint32_t modulus_len, uint8_t *out, uint32_t out_len);
+bool bignum_submod_bytes(const uint8_t *a, uint32_t a_len, const uint8_t *b, uint32_t b_len,
+                          const uint8_t *modulus, uint32_t modulus_len, uint8_t *out, uint32_t out_len);
+bool bignum_mulmod_bytes(const uint8_t *a, uint32_t a_len, const uint8_t *b, uint32_t b_len,
+                          const uint8_t *modulus, uint32_t modulus_len, uint8_t *out, uint32_t out_len);
+bool bignum_invmod_bytes(const uint8_t *a, uint32_t a_len, const uint8_t *modulus, uint32_t modulus_len,
+                          uint8_t *out, uint32_t out_len);
+
+/* --- ecc.c: NIST P-256 elliptic curve point arithmetic, just enough
+ * for TLS's ECDHE key exchange (tls.c). Points on the wire are the
+ * uncompressed SEC1 form: 1 byte (0x04) + 32-byte X + 32-byte Y = 65
+ * bytes total. */
+bool ecc_p256_generate_keypair(const uint8_t *random_seed, uint8_t private_key_out[32], uint8_t public_point_out[65]);
+bool ecc_p256_compute_shared_secret(const uint8_t private_key[32], const uint8_t peer_public_point[65], uint8_t shared_secret_out[32]);
+
 /* --- x509.c: just enough X.509/ASN.1 DER parsing to pull an RSA
  * public key and subject common name out of a TLS server's
  * certificate. Does NOT validate the certificate's signature against
@@ -292,13 +313,19 @@ void aes128_cbc_encrypt(const uint8_t key[16], const uint8_t iv[16], const uint8
 void aes128_cbc_decrypt(const uint8_t key[16], const uint8_t iv[16], const uint8_t *ciphertext, uint32_t len, uint8_t *out);
 
 /* --- rsa.c: RSA public-key encryption with PKCS#1 v1.5 padding
- * (RFC 8017 7.2.1) - encryption only, no private-key operations (a
- * TLS client never needs to decrypt/sign with RSA). Used for TLS 1.2's
- * RSA key-exchange mode. --- */
+ * (RFC 8017 7.2.1) for TLS's RSA key-exchange mode, plus PKCS#1 v1.5
+ * signature verification (RFC 8017 8.2.2, SHA-256 only) for checking
+ * the server's signature over its ECDHE ephemeral key. No private-key
+ * operations either way (decrypt/sign) - a TLS client never needs
+ * those. --- */
 bool rsa_encrypt_pkcs1(const uint8_t *modulus, uint32_t modulus_len,
                         const uint8_t *pub_exponent, uint32_t exponent_len,
                         const uint8_t *message, uint32_t message_len,
                         uint8_t *out, uint32_t out_len);
+bool rsa_verify_pkcs1_sha256(const uint8_t *modulus, uint32_t modulus_len,
+                              const uint8_t *pub_exponent, uint32_t exponent_len,
+                              const uint8_t *signature, uint32_t signature_len,
+                              const uint8_t hash[32]);
 
 /* --- sha256.c: a real cryptographic hash (FIPS 180-4), not a rolled-
  * your-own checksum - see auth.c for what it's used for. --- */

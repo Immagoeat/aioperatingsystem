@@ -57,3 +57,62 @@ bool rsa_encrypt_pkcs1(const uint8_t *modulus, uint32_t modulus_len,
 
 	return bignum_modexp_bytes(padded, modulus_len, pub_exponent, exponent_len, modulus, modulus_len, out, out_len);
 }
+
+/* The DER encoding of the SHA-256 DigestInfo SEQUENCE (RFC 8017
+ * Appendix A.2.4 / RFC 3447): SEQUENCE { SEQUENCE { OID
+ * 2.16.840.1.101.3.4.2.1 (sha256), NULL }, OCTET STRING (32 bytes) }
+ * minus the OCTET STRING's actual content bytes - this is the fixed
+ * 19-byte prefix that comes right before the hash itself inside a
+ * PKCS#1 v1.5 signature. Confirmed against a real signature produced
+ * by `openssl dgst -sha256 -sign` and inspected with `pkeyutl
+ * -verifyrecover -pkeyopt rsa_padding_mode:none` before being used
+ * here, the same live-verification approach used for every other
+ * cryptographic constant in this codebase. */
+static const uint8_t SHA256_DIGESTINFO_PREFIX[19] = {
+	0x30,0x31,0x30,0x0d,0x06,0x09,0x60,0x86,0x48,0x01,0x65,0x03,0x04,0x02,0x01,0x05,0x00,0x04,0x20
+};
+
+/* Verifies a PKCS#1 v1.5 RSA signature (RFC 8017 section 8.2.2) over a
+ * SHA-256 hash, using the public key - "decrypts" the signature with
+ * the public exponent (the same bignum_modexp_bytes() operation
+ * rsa_encrypt_pkcs1() above uses, just with the roles reversed: a
+ * signature is produced with the private key and checked with the
+ * public one) and checks the result has the exact structure a real
+ * signature over `hash` would produce: 0x00 0x01 <0xFF padding> 0x00
+ * <SHA-256 DigestInfo prefix> <hash>. Used by tls.c to check the
+ * server's signature over its ECDHE ephemeral key in ServerKeyExchange
+ * - real protection against a network attacker forging that message,
+ * even though this client doesn't validate the certificate chain
+ * itself against any root CA (see x509.c's file comment). */
+bool rsa_verify_pkcs1_sha256(const uint8_t *modulus, uint32_t modulus_len,
+                              const uint8_t *pub_exponent, uint32_t exponent_len,
+                              const uint8_t *signature, uint32_t signature_len,
+                              const uint8_t hash[32]) {
+	if (signature_len != modulus_len || modulus_len < 11 + 19 + 32) return false;
+
+	static uint8_t decoded[512];
+	if (modulus_len > sizeof(decoded)) return false;
+
+	if (!bignum_modexp_bytes(signature, signature_len, pub_exponent, exponent_len, modulus, modulus_len, decoded, modulus_len)) {
+		return false;
+	}
+
+	if (decoded[0] != 0x00 || decoded[1] != 0x01) return false;
+
+	uint32_t i = 2;
+	while (i < modulus_len && decoded[i] == 0xFF) i++;
+	if (i >= modulus_len || decoded[i] != 0x00) return false;
+	i++;
+
+	if (i + 19 + 32 != modulus_len) return false; /* wrong amount of padding for this exact structure */
+	for (uint32_t j = 0; j < 19; j++) {
+		if (decoded[i + j] != SHA256_DIGESTINFO_PREFIX[j]) return false;
+	}
+	i += 19;
+
+	for (uint32_t j = 0; j < 32; j++) {
+		if (decoded[i + j] != hash[j]) return false;
+	}
+
+	return true;
+}
