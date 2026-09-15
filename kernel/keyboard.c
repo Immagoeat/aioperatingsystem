@@ -55,6 +55,10 @@ static void keyboard_callback(struct registers *regs) {
 				case 0x50: kbd_buffer_push(KEY_ARROW_DOWN); break;
 				case 0x4B: kbd_buffer_push(KEY_ARROW_LEFT); break;
 				case 0x4D: kbd_buffer_push(KEY_ARROW_RIGHT); break;
+				case 0x5B: /* left Windows/Super key */
+				case 0x5C: /* right Windows/Super key */
+					kbd_buffer_push(KEY_SUPER);
+					break;
 				default: break; /* other extended keys: not handled */
 			}
 		}

@@ -355,6 +355,7 @@ bool keyboard_has_key(void);
 #define KEY_ARROW_DOWN  ((char)-2)
 #define KEY_ARROW_LEFT  ((char)-3)
 #define KEY_ARROW_RIGHT ((char)-4)
+#define KEY_SUPER       ((char)-5) /* the Windows/Super/Meta key */
 
 /* --- shell.c --- */
 void shell_run(void);
