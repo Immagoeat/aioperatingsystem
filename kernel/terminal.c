@@ -342,7 +342,13 @@ static void cmd_fetch(char *rest) {
 	html_layout(fetch_body, body_len, &page, 78);
 	if (page.title[0]) { kprintf("Title: %s\n\n", page.title); }
 	for (int i = 0; i < page.line_count; i++) {
-		console_writestring(page.lines[i]);
+		/* the console has no concept of color/bold - CSS styling (see
+		 * html.c/css.c) has nothing to apply to here, so this just
+		 * concatenates each line's runs back into plain text, the same
+		 * output this command always gave before CSS support existed */
+		for (int r = 0; r < page.lines[i].run_count; r++) {
+			console_writestring(page.lines[i].runs[r].text);
+		}
 		console_putchar('\n');
 	}
 	console_writestring("--------------------------------------------------\n");

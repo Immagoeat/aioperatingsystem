@@ -267,6 +267,44 @@ void gfx_draw_char_bg(int x, int y, char c, gfx_color_t fg, gfx_color_t bg) {
 	}
 }
 
+/* Synthetic bold: this kernel has exactly one hand-authored bitmap
+ * font (font8x8.c) with no separate bold glyph set, so real bold text
+ * (for CSS font-weight/heading emphasis - see html.c) is produced by
+ * dilating each glyph row one pixel to the right (`row | (row >> 1)`)
+ * rather than faking it with a color change - the standard technique
+ * terminal emulators and bitmap-font renderers use for synthetic
+ * bold when no dedicated bold glyphs exist. A real, visible pixel
+ * difference, not a label. */
+void gfx_draw_char_bold(int x, int y, char c, gfx_color_t fg) {
+	const uint8_t *glyph = font8x8_get_glyph(c);
+	int size = 8 * glyph_scale;
+
+	if (x >= 0 && y >= 0 && x + size <= screen_w && y + size <= screen_h) {
+		for (int row = 0; row < 8; row++) {
+			uint8_t bits = (uint8_t)(glyph[row] | (glyph[row] >> 1));
+			if (bits == 0) continue;
+			for (int col = 0; col < 8; col++) {
+				if (!(bits & (0x80 >> col))) continue;
+				int px = x + col * glyph_scale, py = y + row * glyph_scale;
+				for (int yy = 0; yy < glyph_scale; yy++) {
+					gfx_color_t *dst = &back_buffer[(py + yy) * screen_w + px];
+					for (int xx = 0; xx < glyph_scale; xx++) dst[xx] = fg;
+				}
+			}
+		}
+		return;
+	}
+
+	for (int row = 0; row < 8; row++) {
+		uint8_t bits = (uint8_t)(glyph[row] | (glyph[row] >> 1));
+		for (int col = 0; col < 8; col++) {
+			if (bits & (0x80 >> col)) {
+				gfx_fill_rect(x + col * glyph_scale, y + row * glyph_scale, glyph_scale, glyph_scale, fg);
+			}
+		}
+	}
+}
+
 int gfx_char_width(void) { return 8 * glyph_scale; }
 int gfx_char_height(void) { return 8 * glyph_scale; }
 
@@ -280,6 +318,22 @@ void gfx_draw_string(int x, int y, const char *s, gfx_color_t fg) {
 			y += ch;
 		} else {
 			gfx_draw_char(cx, y, *s, fg);
+			cx += cw;
+		}
+		s++;
+	}
+}
+
+void gfx_draw_string_bold(int x, int y, const char *s, gfx_color_t fg) {
+	int cx = x;
+	int cw = gfx_char_width();
+	int ch = gfx_char_height();
+	while (*s) {
+		if (*s == '\n') {
+			cx = x;
+			y += ch;
+		} else {
+			gfx_draw_char_bold(cx, y, *s, fg);
 			cx += cw;
 		}
 		s++;

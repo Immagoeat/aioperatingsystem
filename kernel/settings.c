@@ -83,9 +83,10 @@ int timezone_find_closest_option(int offset_minutes) {
  * timezone_offset_minutes) - no persistent settings storage exists in
  * this kernel yet. */
 static const struct ui_scale_option ui_scale_options[] = {
-	{ "Small", 1 },
-	{ "Medium (default)", 2 },
+	{ "Compact", 1 },
+	{ "Standard (default)", 2 },
 	{ "Large", 3 },
+	{ "Extra Large", 4 },
 };
 #define UI_SCALE_OPTION_COUNT_VALUE (int)(sizeof(ui_scale_options) / sizeof(ui_scale_options[0]))
 

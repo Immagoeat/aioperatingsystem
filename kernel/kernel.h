@@ -500,6 +500,11 @@ void gfx_draw_char(int x, int y, char c, gfx_color_t fg);
 void gfx_draw_char_bg(int x, int y, char c, gfx_color_t fg, gfx_color_t bg);
 void gfx_draw_string(int x, int y, const char *s, gfx_color_t fg);
 void gfx_draw_string_bg(int x, int y, const char *s, gfx_color_t fg, gfx_color_t bg);
+/* Synthetic bold (see gfx.c's file comment): dilates each glyph row
+ * one pixel to the right rather than faking weight with color alone -
+ * used for CSS font-weight/heading emphasis in the browser (html.c). */
+void gfx_draw_char_bold(int x, int y, char c, gfx_color_t fg);
+void gfx_draw_string_bold(int x, int y, const char *s, gfx_color_t fg);
 int gfx_string_width(const char *s);
 void gfx_blit_rgb_scaled(const unsigned char *src_rgb, int src_w, int src_h, int dst_x, int dst_y, int dst_w, int dst_h);
 void gfx_flip(void);
@@ -517,22 +522,102 @@ int wallpaper_count(void);
 const struct wallpaper *wallpaper_get(int index);
 void wallpaper_draw(int index, int dst_w, int dst_h);
 
-/* --- html.c: a minimal HTML-to-text renderer for the browser app in
- * wm.c - see html.c's file comment for exactly what it does and
- * doesn't handle (no CSS, no images, no tables, no variable font
- * sizes; <script>/<style> contents are skipped rather than rendered
- * as garbage). */
+/* --- css.c: a real (deliberately narrow) CSS parser and cascade -
+ * color, background-color, font-weight, and text-align only (the
+ * properties this kernel's one fixed-width bitmap font can actually
+ * render - see css.c's file comment for the full scope and why). --- */
+#define CSS_SHEET_MAX_RULES 256
+#define CSS_SELECTOR_NAME_MAX 32
+
+struct css_declared {
+	bool has_color; gfx_color_t color;
+	bool has_background; gfx_color_t background;
+	bool has_bold; bool bold;
+	bool has_align; int align; /* 0=left, 1=center, 2=right */
+};
+
+struct css_rule {
+	int selector_kind; /* 0=tag, 1=class, 2=id - matches enum css_selector_kind in css.c */
+	char selector_name[CSS_SELECTOR_NAME_MAX];
+	struct css_declared decl;
+	int source_order;
+};
+
+struct css_sheet {
+	struct css_rule rules[CSS_SHEET_MAX_RULES];
+	int rule_count;
+};
+
+void css_parse_stylesheet(const uint8_t *css, uint32_t css_len, struct css_sheet *sheet);
+void css_parse_inline_style(const char *style_attr, struct css_declared *decl);
+void css_resolve_style(const struct css_sheet *sheet, const char *tag, const char *id, const char *classes,
+                        const struct css_declared *inline_decl, struct css_declared *out);
+
+/* --- html.c: a real (if deliberately narrow) HTML renderer for the
+ * browser app in wm.c - turns markup into styled, word-wrapped lines,
+ * applying any real CSS on the page via css.c (color, background,
+ * bold, text-align - see css.c's file comment for exactly what's
+ * supported and why). Still no images, no tables, no true layout
+ * (positioning/flexbox/etc.) - a real text browser's worth of
+ * rendering, not a full engine. Each line is a sequence of styled
+ * "runs" rather than one plain string, since CSS can change color/
+ * weight partway through a line (e.g. "plain text <strong>bold
+ * text</strong> plain text" all word-wrapped onto one line). */
 #define HTML_MAX_LINES 2048
-#define HTML_LINE_MAX 256
+#define HTML_LINE_MAX 256 /* max rendered line width (wrap_cols is clamped to this) - unrelated to HTML_RUN_TEXT_MAX below, which bounds one run within a line, not the whole line */
 #define HTML_TEXT_MAX (64 * 1024)
 #define HTML_TITLE_MAX 128
+/* A run only ever needs to hold up to one line's worth of same-styled
+ * text, so in principle it could be as large as HTML_LINE_MAX - but
+ * struct html_page holds HTML_MAX_LINES of these, so every byte here
+ * is paid HTML_MAX_LINES * HTML_MAX_RUNS_PER_LINE times over (2048 *
+ * 6 = 12288x) - kept deliberately smaller than a full line: a run
+ * this long that turns out to need more space simply becomes two
+ * (or more) runs instead of one (see html.c's can_extend check, which
+ * falls back to starting a new run rather than overflowing this
+ * buffer) - a real, safe degradation, not data loss. */
+#define HTML_RUN_TEXT_MAX 64
+#define HTML_MAX_RUNS_PER_LINE 6
+
+struct html_run {
+	char text[HTML_RUN_TEXT_MAX];
+	gfx_color_t color;
+	gfx_color_t background; /* only meaningful when has_background is true - GFX_RGB(0,0,0) is a real color (black), not "unset" */
+	bool has_background;
+	bool bold;
+};
+
+struct html_line {
+	struct html_run runs[HTML_MAX_RUNS_PER_LINE];
+	int run_count;
+	int align; /* 0=left, 1=center, 2=right - resolved from whichever element's text produced this line */
+};
 
 struct html_page {
 	char title[HTML_TITLE_MAX];
-	char lines[HTML_MAX_LINES][HTML_LINE_MAX];
+	struct html_line lines[HTML_MAX_LINES];
 	int line_count;
 };
 void html_layout(const uint8_t *html_bytes, uint32_t html_len, struct html_page *page, int wrap_cols);
+
+/* Same as html_layout(), but also merges `extra_css` (already-fetched
+ * external stylesheet text, concatenated - see
+ * html_find_stylesheet_links() below and wm.c's browser_load(), which
+ * is what actually fetches it) into the cascade alongside the page's
+ * own inline <style> blocks and style="" attributes. Pass NULL/0 for
+ * extra_css to behave exactly like html_layout() (which is in fact
+ * defined as calling this with extra_css=NULL - see html.c). */
+void html_layout_with_css(const uint8_t *html_bytes, uint32_t html_len, const uint8_t *extra_css, uint32_t extra_css_len, struct html_page *page, int wrap_cols);
+
+/* Scans for <link rel="stylesheet" href="..."> tags and collects the
+ * raw href values (no URL resolution - see html.c's file comment on
+ * html_find_stylesheet_links() for why that's the caller's job, and
+ * why this exists at all: real sites overwhelmingly link external
+ * CSS rather than inline it). Returns how many were found (capped at
+ * max_urls). */
+#define HTML_STYLESHEET_URL_MAX 256
+#define HTML_MAX_STYLESHEET_LINKS 8
+uint32_t html_find_stylesheet_links(const uint8_t *html, uint32_t html_len, char urls[][HTML_STYLESHEET_URL_MAX], uint32_t max_urls);
 
 /* --- inflate.c: a real DEFLATE decompressor (RFC 1951) plus a gzip
  * container wrapper (RFC 1952), for decoding HTTP responses sent with

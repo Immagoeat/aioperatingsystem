@@ -335,7 +335,7 @@ static struct settings_layout settings_compute_layout(struct window *w) {
 	L.tz_field_y = y;
 	y += L.field_h + 20;
 	y += L.lh + 6; /* "UI Scale" section title */
-	y += L.lh * 2 + 10; /* its two description lines */
+	y += L.lh * 3 + 10; /* its two description lines, plus the detected-resolution line */
 	L.scale_field_y = y;
 
 	return L;
@@ -416,7 +416,23 @@ static void paint_settings(struct window *w) {
 
 	gfx_draw_string(x, y, "UI Scale", w->accent); y += L.lh + 6;
 	gfx_draw_string(x, y, "There's no real video-mode switch here,", COL_TEXT_DIM); y += L.lh;
-	gfx_draw_string(x, y, "so this resizes the desktop's UI instead:", COL_TEXT_DIM); y += L.lh + 10;
+	gfx_draw_string(x, y, "so this resizes the desktop's UI instead:", COL_TEXT_DIM); y += L.lh;
+	{
+		char detected[48];
+		strcpy(detected, "Detected screen: ");
+		char numbuf[12]; int n, i;
+		n = screen_w; i = 11; numbuf[i] = '\0';
+		if (n == 0) numbuf[--i] = '0';
+		while (n > 0) { numbuf[--i] = (char)('0' + n % 10); n /= 10; }
+		strcat(detected, &numbuf[i]);
+		strcat(detected, "x");
+		n = screen_h; i = 11; numbuf[i] = '\0';
+		if (n == 0) numbuf[--i] = '0';
+		while (n > 0) { numbuf[--i] = (char)('0' + n % 10); n /= 10; }
+		strcat(detected, &numbuf[i]);
+		gfx_draw_string(x, y, detected, COL_TEXT_DIM);
+	}
+	y += L.lh + 10;
 
 	draw_dropdown_field(x, w->y + L.scale_field_y, L.field_w, L.field_h, ui_scale_label_at(settings_scale_selected[idx]), settings_open[idx] == SETTINGS_DROPDOWN_SCALE);
 
@@ -567,7 +583,7 @@ static void settings_natural_size(int *out_w, int *out_h) {
 	*out_w = max_w + 2 * PADDING;
 
 	int h = lh + 6 + lh * 3 + 10 + field_h + 20 /* Timezone section */
-	       + lh + 6 + lh * 2 + 10 + field_h     /* UI Scale section */
+	       + lh + 6 + lh * 3 + 10 + field_h     /* UI Scale section (2 description lines + detected-resolution line) */
 	       + 24 + PADDING;                       /* footer + trailing margin */
 	*out_h = h;
 }
@@ -752,6 +768,15 @@ struct browser_state {
 };
 static struct browser_state browser[MAX_WINDOWS];
 static uint8_t browser_body[BROWSER_BODY_MAX]; /* one fetch at a time overall (this OS has no real concurrency) - shared, not per-window */
+/* Separate from browser_body since a page's external stylesheets are
+ * fetched one at a time *after* the page body itself has already
+ * been fetched into browser_body and needs to stay there (it's what
+ * html_layout_with_css() parses at the end) - fetching a stylesheet
+ * into the same buffer would clobber the page it's meant to style. */
+#define BROWSER_CSS_FETCH_MAX (32 * 1024)
+static uint8_t browser_css_fetch[BROWSER_CSS_FETCH_MAX];
+#define BROWSER_CSS_TOTAL_MAX (48 * 1024)
+static uint8_t browser_css_total[BROWSER_CSS_TOTAL_MAX]; /* every fetched stylesheet's text, concatenated */
 
 /* Splits "[http://|https://]host[:port][/path]" into its pieces.
  * Defaults: scheme http, port 80 (or 443 for https), path "/". No
@@ -799,28 +824,71 @@ static bool browser_parse_url(const char *url, struct parsed_url *out) {
 	return true;
 }
 
-static void browser_load(struct window *w) {
-	int idx = (int)(w - windows);
-	struct browser_state *st = &browser[idx];
-
-	st->has_page = false;
-	st->has_error = false;
-	st->scroll = 0;
-
-	struct parsed_url u;
-	if (!browser_parse_url(st->url, &u)) {
-		st->has_error = true;
-		strcpy(st->error, "Invalid URL. Try: http://host/path or https://host/path");
-		return;
+/* Resolves a <link href="..."> value against the page it was found
+ * on - `href` can be a full absolute URL (http://.../style.css),
+ * protocol-relative (//cdn.example.com/style.css - treated as https,
+ * the modern default for a scheme-less reference), an absolute path
+ * (/static/style.css - same host/scheme as the page, path replaced
+ * wholesale), or a same-directory relative path (style.css or
+ * ../style.css - resolved against the page's own path's directory).
+ * No ".." segment normalization (a relative "../x" is resolved by
+ * literal string concatenation, then left as-is even though the
+ * result contains a literal ".." component) - real servers resolve
+ * "/foo/../bar.css" as a normal URL path themselves regardless of
+ * whether the client normalizes it first, so this doesn't need its
+ * own normalizer to work correctly against a real HTTP server, just
+ * to look slightly odd if inspected). */
+static bool browser_resolve_url(const struct parsed_url *base, const char *href, struct parsed_url *out) {
+	if (strncmp(href, "http://", 7) == 0 || strncmp(href, "https://", 8) == 0) {
+		return browser_parse_url(href, out);
 	}
 
+	out->https = base->https;
+	out->port = base->port;
+
+	if (href[0] == '/' && href[1] == '/') {
+		/* protocol-relative: reuse the base page's own scheme, then
+		 * parse the rest exactly like a scheme-prefixed URL would be */
+		char buf[BROWSER_URL_MAX];
+		strcpy(buf, base->https ? "https:" : "http:");
+		strcat(buf, href);
+		return browser_parse_url(buf, out);
+	}
+
+	strcpy(out->host, base->host);
+
+	if (href[0] == '/') {
+		uint32_t len = 0;
+		while (href[len] && len < BROWSER_PATH_MAX - 1) { out->path[len] = href[len]; len++; }
+		out->path[len] = '\0';
+		return true;
+	}
+
+	/* same-directory relative reference: take everything in the
+	 * base path up to and including its last '/', then append href */
+	const char *last_slash = base->path;
+	for (const char *p = base->path; *p; p++) if (*p == '/') last_slash = p;
+	uint32_t dir_len = (uint32_t)(last_slash - base->path) + 1;
+	if (dir_len > BROWSER_PATH_MAX - 1) dir_len = BROWSER_PATH_MAX - 1;
+
+	memcpy(out->path, base->path, dir_len);
+	uint32_t pos = dir_len;
+	uint32_t href_len = (uint32_t)strlen(href);
+	if (pos + href_len > BROWSER_PATH_MAX - 1) href_len = BROWSER_PATH_MAX - 1 - pos;
+	memcpy(out->path + pos, href, href_len);
+	out->path[pos + href_len] = '\0';
+	return true;
+}
+
+/* Resolves and fetches one URL's body into `out_buf` - the DNS + IP-
+ * string-formatting + net_http_get()/net_https_get() dance
+ * browser_load() below needs for the main page, and again (with a
+ * different URL each time) for every external stylesheet it links.
+ * `out_error` follows this codebase's usual bounded-error-message
+ * convention. */
+static bool browser_fetch_url(const struct parsed_url *u, uint8_t *out_buf, uint32_t out_buf_max, uint32_t *out_len, char *out_error, uint32_t out_error_len) {
 	uint32_t ip;
-	char neterr[96];
-	if (!net_resolve_hostname(u.host, &ip, neterr, sizeof(neterr))) {
-		st->has_error = true;
-		strcpy(st->error, neterr);
-		return;
-	}
+	if (!net_resolve_hostname(u->host, &ip, out_error, out_error_len)) return false;
 
 	char ip_str[16];
 	{
@@ -836,22 +904,64 @@ static void browser_load(struct window *w) {
 		ip_str[pos] = '\0';
 	}
 
-	uint32_t body_len = 0;
-	bool ok;
-	if (u.https) {
-		ok = net_https_get(ip, u.host, u.port, u.path, browser_body, sizeof(browser_body), &body_len, neterr, sizeof(neterr));
-	} else {
-		ok = net_http_get(ip_str, u.port, u.path, browser_body, sizeof(browser_body), &body_len, neterr, sizeof(neterr));
+	if (u->https) {
+		return net_https_get(ip, u->host, u->port, u->path, out_buf, out_buf_max, out_len, out_error, out_error_len);
+	}
+	return net_http_get(ip_str, u->port, u->path, out_buf, out_buf_max, out_len, out_error, out_error_len);
+}
+
+static void browser_load(struct window *w) {
+	int idx = (int)(w - windows);
+	struct browser_state *st = &browser[idx];
+
+	st->has_page = false;
+	st->has_error = false;
+	st->scroll = 0;
+
+	struct parsed_url u;
+	if (!browser_parse_url(st->url, &u)) {
+		st->has_error = true;
+		strcpy(st->error, "Invalid URL. Try: http://host/path or https://host/path");
+		return;
 	}
 
-	if (!ok) {
+	uint32_t body_len = 0;
+	char neterr[96];
+	if (!browser_fetch_url(&u, browser_body, sizeof(browser_body), &body_len, neterr, sizeof(neterr))) {
 		st->has_error = true;
 		strcpy(st->error, neterr);
 		return;
 	}
 
+	/* External stylesheets: discover <link rel="stylesheet"> URLs in
+	 * the page just fetched, resolve each against this page's own URL,
+	 * and fetch them one at a time into browser_css_total, before
+	 * html.c ever sees any of it - this is what actually makes CSS
+	 * visible on most real sites (see html.c's file comment on
+	 * html_find_stylesheet_links() for why). A failed/timed-out
+	 * stylesheet fetch is skipped rather than aborting the whole page
+	 * load - a real browser doesn't refuse to show a page just because
+	 * one of its stylesheets didn't load either. */
+	static char stylesheet_urls[HTML_MAX_STYLESHEET_LINKS][HTML_STYLESHEET_URL_MAX];
+	uint32_t stylesheet_count = html_find_stylesheet_links(browser_body, body_len, stylesheet_urls, HTML_MAX_STYLESHEET_LINKS);
+
+	uint32_t css_total_len = 0;
+	for (uint32_t s = 0; s < stylesheet_count; s++) {
+		struct parsed_url css_url;
+		if (!browser_resolve_url(&u, stylesheet_urls[s], &css_url)) continue;
+
+		uint32_t css_len = 0;
+		char css_err[96];
+		if (!browser_fetch_url(&css_url, browser_css_fetch, sizeof(browser_css_fetch), &css_len, css_err, sizeof(css_err))) continue;
+
+		if (css_total_len + css_len > sizeof(browser_css_total)) css_len = (uint32_t)sizeof(browser_css_total) - css_total_len;
+		memcpy(browser_css_total + css_total_len, browser_css_fetch, css_len);
+		css_total_len += css_len;
+		if (css_total_len >= sizeof(browser_css_total)) break;
+	}
+
 	int wrap_cols = (w->w - 2 * PADDING) / gfx_char_width();
-	html_layout(browser_body, body_len, &st->page, wrap_cols);
+	html_layout_with_css(browser_body, body_len, browser_css_total, css_total_len, &st->page, wrap_cols);
 	st->has_page = true;
 }
 
@@ -866,15 +976,31 @@ static void browser_natural_size(int *out_w, int *out_h) {
 	*out_h = 26 * (ch + 4) + 2 * PADDING;
 }
 
+/* Address bar bounds, window-relative - the one clickable/focusable
+ * element in the Browser window (everything below it is just
+ * scrollable page text, no click targets of its own yet). Shared
+ * between paint_browser() (which draws at these exact positions) and
+ * click_browser() (which hit-tests against them), the same
+ * single-source-of-layout approach Settings' dropdowns use, so the
+ * two can never drift apart. */
+#define BROWSER_ADDRESS_BAR_H 30
+
+static void browser_address_bar_bounds(struct window *w, int *out_x, int *out_y, int *out_w, int *out_h) {
+	*out_x = PADDING;
+	*out_y = TITLEBAR_H + PADDING;
+	*out_w = w->w - 2 * PADDING;
+	*out_h = BROWSER_ADDRESS_BAR_H;
+}
+
 static void paint_browser(struct window *w) {
 	int idx = (int)(w - windows);
 	struct browser_state *st = &browser[idx];
-	int x = w->x + PADDING, y = w->y + TITLEBAR_H + PADDING;
 	int lh = gfx_char_height() + 4;
 
 	/* address bar */
-	int field_w = w->w - 2 * PADDING;
-	int field_h = 30;
+	int bar_x, bar_y, field_w, field_h;
+	browser_address_bar_bounds(w, &bar_x, &bar_y, &field_w, &field_h);
+	int x = w->x + bar_x, y = w->y + bar_y;
 	gfx_fill_round_rect(x, y, field_w, field_h, 6, st->editing_url ? COL_WIN_BODY_ALT : COL_TASKBAR);
 	const char *shown = st->url_len > 0 ? st->url : "Type a URL and press Enter (e.g. http://93.184.216.34/)";
 	gfx_draw_string(x + 10, y + (field_h - gfx_char_height()) / 2, shown, st->url_len > 0 ? COL_TEXT : COL_TEXT_DIM);
@@ -914,7 +1040,28 @@ static void paint_browser(struct window *w) {
 	if (st->scroll < 0) st->scroll = 0;
 
 	for (int i = st->scroll; i < st->page.line_count && i < st->scroll + max_visible; i++) {
-		gfx_draw_string(x, y, st->page.lines[i], COL_TEXT);
+		const struct html_line *line = &st->page.lines[i];
+
+		/* text-align: measure the whole line's rendered width first
+		 * (sum of every run's string width) so center/right alignment
+		 * has something to offset against - left stays at run_x = x,
+		 * matching this renderer's behavior before CSS text-align
+		 * existed at all. */
+		int line_w = 0;
+		for (int r = 0; r < line->run_count; r++) line_w += gfx_string_width(line->runs[r].text);
+		int run_x = x;
+		if (line->align == 1) run_x = x + (field_w - line_w) / 2;
+		else if (line->align == 2) run_x = x + (field_w - line_w);
+		if (run_x < x) run_x = x; /* a line wider than the window (shouldn't happen post-wrap, but never draw further left than the margin) */
+
+		for (int r = 0; r < line->run_count; r++) {
+			const struct html_run *run = &line->runs[r];
+			int run_w = gfx_string_width(run->text);
+			if (run->has_background) gfx_fill_rect(run_x, y, run_w, lh, run->background);
+			if (run->bold) gfx_draw_string_bold(run_x, y, run->text, run->color);
+			else gfx_draw_string(run_x, y, run->text, run->color);
+			run_x += run_w;
+		}
 		y += lh;
 	}
 }
@@ -945,6 +1092,26 @@ static void key_browser(struct window *w, char c) {
 
 	if (c == KEY_ARROW_UP) { if (st->scroll > 0) st->scroll--; }
 	else if (c == KEY_ARROW_DOWN) { st->scroll++; }
+}
+
+/* Clicking the address bar focuses it for typing, same as a real
+ * browser - previously the only way back into the address bar once a
+ * page had loaded was the (undiscoverable) Ctrl+L shortcut, since
+ * Browser never had a window_click_fn at all. Selects the whole
+ * existing URL implicitly by just letting further typing append after
+ * it, matching this client's existing "type to append, Backspace to
+ * edit" address bar behavior rather than introducing text selection
+ * (which doesn't exist anywhere else in this UI either). */
+static void click_browser(struct window *w, int x, int y) {
+	int idx = (int)(w - windows);
+	struct browser_state *st = &browser[idx];
+
+	int bar_x, bar_y, bar_w, bar_h;
+	browser_address_bar_bounds(w, &bar_x, &bar_y, &bar_w, &bar_h);
+
+	if (x >= bar_x && x < bar_x + bar_w && y >= bar_y && y < bar_y + bar_h) {
+		st->editing_url = true;
+	}
 }
 
 /* paint_browser() already clamps st->scroll into [0, line_count -
@@ -1157,7 +1324,7 @@ void wm_init(void) {
 	register_app("Palette", 100, 290, 320, 160, paint_palette, palette_natural_size, ICON_PALETTE, GFX_RGB(0xB1, 0x8C, 0xFF));
 	register_interactive_app("Settings", 100, 40, 380, 330, paint_settings, key_settings, click_settings, scroll_settings, settings_natural_size, ICON_GEAR, GFX_RGB(0x4D, 0xD0, 0xC7));
 	register_interactive_app("Text Editor", 40, 20, 520, 400, paint_texteditor, key_texteditor, NULL, NULL, texteditor_natural_size, ICON_DOCUMENT, COL_ACCENT);
-	register_interactive_app("Browser", 30, 10, 640, 460, paint_browser, key_browser, NULL, scroll_browser, browser_natural_size, ICON_GLOBE, GFX_RGB(0xFF, 0x8A, 0x3D));
+	register_interactive_app("Browser", 30, 10, 640, 460, paint_browser, key_browser, click_browser, scroll_browser, browser_natural_size, ICON_GLOBE, GFX_RGB(0xFF, 0x8A, 0x3D));
 	register_console_app("Terminal", ICON_TERMINAL);
 
 	/* Apps are registered so search/the taskbar can find them, but none
