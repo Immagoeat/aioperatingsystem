@@ -505,6 +505,9 @@ bool asm_assemble(const char *source, uint8_t *out_code, uint32_t out_capacity, 
  * or a `ret`, at which point control returns here normally. */
 extern void asm_run_trampoline(void *code);
 
+bool asm_program_running = false;
+bool asm_program_crashed = false;
+
 uint64_t asm_run(const uint8_t *code, uint32_t len) {
 	/* Executable data must live in a buffer the CPU will actually
 	 * fetch instructions from; since this kernel's page tables identity
@@ -516,6 +519,11 @@ uint64_t asm_run(const uint8_t *code, uint32_t len) {
 	memcpy(exec_buf, code, len);
 
 	asm_last_exit_code = 0;
+	asm_program_crashed = false;
+	asm_program_running = true;
 	asm_run_trampoline(exec_buf);
+	asm_program_running = false;
+
+	if (asm_program_crashed) return (uint64_t)-1;
 	return asm_last_exit_code;
 }

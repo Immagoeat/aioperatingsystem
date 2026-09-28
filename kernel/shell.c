@@ -4,7 +4,7 @@
 
 static char cmd_buffer[CMD_BUFFER_SIZE];
 
-static void print_prompt(void) {
+void shell_print_prompt(void) {
 	console_set_color(GFX_RGB(0x5C, 0xE1, 0x9C));
 	console_writestring("aurora");
 	console_set_color(console_color_default());
@@ -144,7 +144,7 @@ static void auto_launch_countdown(void) {
  * offered (you're already inside the desktop - re-entering wm_run()
  * from here would recurse into it instead of returning to it), and
  * `exit` is offered instead to return control to the desktop. */
-static void dispatch(char *line, bool from_gui, bool *should_exit) {
+void shell_dispatch(char *line, bool from_gui, bool *should_exit) {
 	char *saveptr;
 	char *cmd = strtok_simple(line, ' ', &saveptr);
 	if (!cmd) return;
@@ -194,30 +194,9 @@ void shell_run(void) {
 
 	bool should_exit = false; /* unused at the top level - nothing to exit to */
 	for (;;) {
-		print_prompt();
+		shell_print_prompt();
 		read_line(cmd_buffer, CMD_BUFFER_SIZE);
-		dispatch(cmd_buffer, false, &should_exit);
+		shell_dispatch(cmd_buffer, false, &should_exit);
 	}
 }
 
-/* Entry point for launching a shell as a GUI app (see wm.c's "Terminal"
- * app): the same command set as the top-level shell, minus the countdown
- * (nothing to auto-boot into - we're already in the desktop) and with
- * `exit` in place of `gui`, so the user has a way back to the desktop
- * instead of recursing into another copy of it. wm.c is responsible for
- * switching graphics modes before/after calling this, the same way it
- * already does for the Text Editor app. */
-void terminal_app_run(void) {
-	static char nested_cmd_buffer[CMD_BUFFER_SIZE];
-	console_clear();
-	console_writestring("auroraOS Terminal - type 'exit' to return to the desktop.\n\n");
-
-	bool should_exit = false;
-	while (!should_exit) {
-		print_prompt();
-		read_line(nested_cmd_buffer, CMD_BUFFER_SIZE);
-		dispatch(nested_cmd_buffer, true, &should_exit);
-	}
-
-	console_clear();
-}

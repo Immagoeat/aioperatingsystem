@@ -19,6 +19,11 @@ static int con_x, con_y; /* cursor cell position */
 static gfx_color_t con_color;
 static uint32_t cursor_blink_tick;
 
+/* When non-NULL, console_putchar/console_set_color/console_clear act on
+ * this grid instead of the real framebuffer console - see
+ * console_redirect_to()'s doc comment in kernel.h. */
+static struct vconsole *redirect_vc = NULL;
+
 /* one back-buffer of cell contents so we can redraw/scroll cleanly */
 #define CON_MAX_COLS 220
 #define CON_MAX_ROWS 90
@@ -57,6 +62,7 @@ void console_init(void) {
 }
 
 void console_set_color(gfx_color_t color) {
+	if (redirect_vc) { redirect_vc->color = color; return; }
 	con_color = color;
 }
 
@@ -74,10 +80,58 @@ static void con_scroll(void) {
 }
 
 void console_clear(void) {
+	if (redirect_vc) {
+		memset(redirect_vc->cell_char, 0, sizeof(redirect_vc->cell_char));
+		redirect_vc->cur_x = 0;
+		redirect_vc->cur_y = 0;
+		return;
+	}
 	memset(cell_char, 0, sizeof(cell_char));
 	con_x = 0;
 	con_y = 0;
 	gfx_fill_rect(0, 0, gfx_width(), gfx_height(), COL_BG);
+}
+
+void vconsole_init(struct vconsole *vc, int cols) {
+	memset(vc, 0, sizeof(*vc));
+	vc->cols = cols > VCON_COLS ? VCON_COLS : cols;
+	vc->color = COL_FG;
+}
+
+void console_redirect_to(struct vconsole *vc) {
+	redirect_vc = vc;
+}
+
+static void vconsole_putchar(struct vconsole *vc, char c) {
+	if (c == '\n') {
+		vc->cur_x = 0;
+		vc->cur_y++;
+	} else if (c == '\r') {
+		vc->cur_x = 0;
+	} else if (c == '\t') {
+		vc->cur_x = (vc->cur_x + 4) & ~3;
+	} else if (c == '\b') {
+		if (vc->cur_x > 0) {
+			vc->cur_x--;
+			vc->cell_char[vc->cur_y % VCON_ROWS][vc->cur_x] = 0;
+		}
+		return;
+	} else {
+		if (vc->cur_x >= vc->cols) {
+			vc->cur_x = 0;
+			vc->cur_y++;
+		}
+		int row = vc->cur_y % VCON_ROWS;
+		vc->cell_char[row][vc->cur_x] = c;
+		vc->cell_color[row][vc->cur_x] = vc->color;
+		vc->cur_x++;
+		return;
+	}
+
+	if (vc->cur_x >= vc->cols) {
+		vc->cur_x = 0;
+		vc->cur_y++;
+	}
 }
 
 void console_putchar(char c) {
@@ -88,6 +142,11 @@ void console_putchar(char c) {
 	 * -debugcon_output`) for scripted testing. Free when not using
 	 * -debugcon: QEMU just discards unmapped port writes. */
 	outb(0xE9, (uint8_t)c);
+
+	if (redirect_vc) {
+		vconsole_putchar(redirect_vc, c);
+		return;
+	}
 
 	int cw = gfx_char_width();
 	int ch = gfx_char_height() + CON_LINE_SPACING;
@@ -140,6 +199,12 @@ void console_set_cursor(int x, int y) {
 	 * arbitrary cursor movement instead of always writing at end-of-text. */
 	if (x < 0) x = 0;
 	if (y < 0) y = 0;
+	if (redirect_vc) {
+		if (x >= redirect_vc->cols) x = redirect_vc->cols - 1;
+		redirect_vc->cur_x = x;
+		redirect_vc->cur_y = y;
+		return;
+	}
 	if (x >= con_cols) x = con_cols - 1;
 	if (y >= con_rows) y = con_rows - 1;
 	con_x = x;
@@ -169,6 +234,12 @@ static void draw_cursor(bool on) {
 }
 
 void console_present(void) {
+	/* While redirected, the windowed Terminal's own paint function (run
+	 * from wm_run()'s regular frame loop) is what actually reaches the
+	 * screen - flipping here would just race it for no benefit, and
+	 * con_x/con_y/cell_char aren't even what's on screen right now. */
+	if (redirect_vc) return;
+
 	uint32_t t = timer_get_ticks();
 	bool on = ((t / 30) % 2) == 0;
 	if (t != cursor_blink_tick) {

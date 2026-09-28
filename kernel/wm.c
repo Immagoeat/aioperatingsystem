@@ -598,12 +598,23 @@ static void settings_natural_size(int *out_w, int *out_h) {
  * (only one Text Editor window can exist at a time, same one-per-name
  * rule every app here follows). */
 #define TEXTEDITOR_FILENAME_MAX 32
+
+/* Text Editor is modal (vim-style), unlike nano/noteedit.c's core which
+ * stays a plain always-insert editor everywhere else it's used (the
+ * console `nano` command, the windowed Terminal's nano sub-mode) - see
+ * key_texteditor()'s doc comment below for why the mode logic lives
+ * here instead of in noteedit.c. */
+enum vim_mode { VIM_NORMAL, VIM_INSERT };
+
 struct texteditor_state {
 	bool picking_filename; /* true = showing the filename field; false = editing */
 	char filename[TEXTEDITOR_FILENAME_MAX];
 	int filename_len;
 	struct note_buffer nb;
 	bool loaded; /* true once note_load() has actually run for `filename` */
+
+	enum vim_mode vim_mode;
+	char vim_pending; /* 0, or the first key of a two-key command awaiting its second (`g` of "gg", `d` of "dd") */
 };
 static struct texteditor_state texteditor[MAX_WINDOWS];
 
@@ -669,8 +680,9 @@ static void paint_texteditor(struct window *w) {
 		if (n == 0) numbuf[--i] = '0';
 		while (n > 0) { numbuf[--i] = (char)('0' + n % 10); n /= 10; }
 		strcat(pos, &numbuf[i]);
+		strcat(pos, st->vim_mode == VIM_INSERT ? "  -- INSERT --" : "  -- NORMAL --");
 	}
-	gfx_draw_string(x, y, pos, COL_TEXT_DIM);
+	gfx_draw_string(x, y, pos, st->vim_mode == VIM_INSERT ? GFX_RGB(0x5C, 0xE1, 0x9C) : COL_TEXT_DIM);
 	y += lh + 8;
 	int text_area_top = y; /* first text row's y - used below for the cursor's y math too, so it can't drift out of sync with the header layout above */
 
@@ -703,14 +715,234 @@ static void paint_texteditor(struct window *w) {
 	}
 
 	/* blinking text-entry cursor at the real (cur_line, cur_col)
-	 * position, the windowed equivalent of console_set_cursor() */
+	 * position, the windowed equivalent of console_set_cursor() - a
+	 * full block in normal mode (vim's own convention: it's sitting ON
+	 * a character, ready to act on it) and a thin bar in insert mode
+	 * (sitting BETWEEN characters, about to add one) */
 	if (((timer_get_ticks() / 30) % 2) == 0) {
 		int cursor_row = st->nb.cur_line - visible_start;
 		if (cursor_row >= 0 && cursor_row < max_visible) {
 			int cx = x + gutter_px + st->nb.cur_col * char_w;
 			int cy = text_area_top + cursor_row * row_h;
-			gfx_fill_rect(cx, cy, 2, gfx_char_height(), w->accent);
+			if (st->vim_mode == VIM_NORMAL) {
+				gfx_blend_rect(cx, cy, char_w, gfx_char_height(), w->accent, 130);
+			} else {
+				gfx_fill_rect(cx, cy, 2, gfx_char_height(), w->accent);
+			}
 		}
+	}
+}
+
+/* --- vim motions: normal-mode key handling for Text Editor only (see
+ * the file comment above struct texteditor_state's vim_mode field for
+ * why this doesn't live in noteedit.c). Deliberately a small, common
+ * subset rather than a full vim clone - no registers, no counts before
+ * a command (`3dd`), no visual mode, no `:` command line - just the
+ * motions/edits used often enough that not having them is what people
+ * actually notice: hjkl, word motions, line start/end, buffer
+ * start/end, x/dd to delete, the four ways into insert mode. Operates
+ * directly on st->nb's fields rather than going through
+ * note_handle_key() (that's still what insert mode itself uses - see
+ * key_texteditor() below), since motions like `w`/`0`/`gg` have no
+ * insert-mode equivalent to share. */
+
+static bool vim_is_word_char(char c) {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+}
+
+/* Moves cur_line/cur_col forward to the start of the next word, vim's
+ * `w` - treats a run of word characters, a run of punctuation, and a
+ * blank line each as their own "word", and crosses line boundaries the
+ * same way vim does (off the end of one line lands on the start of the
+ * next, not on the newline itself - there's no separate newline
+ * character in this buffer's per-line storage to land on anyway). */
+static void vim_move_word_forward(struct note_buffer *nb) {
+	int line = nb->cur_line, col = nb->cur_col;
+	int len = (int)strlen(nb->lines[line]);
+
+	if (col >= len) {
+		if (line < nb->line_count - 1) { nb->cur_line++; nb->cur_col = 0; }
+		return;
+	}
+
+	bool started_word = vim_is_word_char(nb->lines[line][col]);
+	bool started_punct = !started_word && nb->lines[line][col] != ' ' && nb->lines[line][col] != '\t';
+
+	while (col < len) {
+		char c = nb->lines[line][col];
+		bool is_word = vim_is_word_char(c);
+		bool is_punct = !is_word && c != ' ' && c != '\t';
+		if (started_word && !is_word) break;
+		if (started_punct && !is_punct) break;
+		col++;
+	}
+	while (col < len && (nb->lines[line][col] == ' ' || nb->lines[line][col] == '\t')) col++;
+
+	if (col >= len && line < nb->line_count - 1) {
+		nb->cur_line++;
+		nb->cur_col = 0;
+	} else {
+		nb->cur_col = col;
+	}
+}
+
+/* vim's `b` - the mirror image of the above: skip back over any
+ * whitespace immediately behind the cursor, then back to the start of
+ * the word/punctuation run behind that. */
+static void vim_move_word_backward(struct note_buffer *nb) {
+	int line = nb->cur_line, col = nb->cur_col;
+
+	if (col == 0) {
+		if (line == 0) return;
+		line--;
+		col = (int)strlen(nb->lines[line]);
+		nb->cur_line = line;
+		nb->cur_col = col;
+		if (col == 0) return; /* landed on an empty line - that's the word */
+	}
+
+	while (col > 0 && (nb->lines[line][col - 1] == ' ' || nb->lines[line][col - 1] == '\t')) col--;
+	if (col > 0) {
+		bool is_word = vim_is_word_char(nb->lines[line][col - 1]);
+		while (col > 0) {
+			char c = nb->lines[line][col - 1];
+			bool c_word = vim_is_word_char(c);
+			if (c == ' ' || c == '\t') break;
+			if (c_word != is_word) break;
+			col--;
+		}
+	}
+	nb->cur_col = col;
+}
+
+/* Deletes the current line (vim's `dd`) - line_count always stays at
+ * least 1, same as note_handle_key()'s own invariant elsewhere, so
+ * deleting the last remaining line just clears it instead of leaving
+ * an empty buffer with zero lines. */
+static void vim_delete_line(struct note_buffer *nb) {
+	if (nb->line_count <= 1) {
+		nb->lines[0][0] = '\0';
+		nb->cur_col = 0;
+		nb->dirty = true;
+		return;
+	}
+	for (int i = nb->cur_line; i < nb->line_count - 1; i++) {
+		strcpy(nb->lines[i], nb->lines[i + 1]);
+	}
+	nb->line_count--;
+	if (nb->cur_line >= nb->line_count) nb->cur_line = nb->line_count - 1;
+	int len = (int)strlen(nb->lines[nb->cur_line]);
+	if (nb->cur_col > len) nb->cur_col = len;
+	nb->dirty = true;
+}
+
+/* Returns true if the key was consumed (whether or not it changed
+ * anything - a motion with nowhere left to go still "handles" the
+ * key). false means key_texteditor() should ignore it, same
+ * convention as note_handle_key(). */
+static bool vim_handle_normal_key(struct texteditor_state *st, char c) {
+	struct note_buffer *nb = &st->nb;
+
+	if (st->vim_pending == 'g') {
+		st->vim_pending = 0;
+		if (c == 'g') { nb->cur_line = 0; nb->cur_col = 0; }
+		return true;
+	}
+	if (st->vim_pending == 'd') {
+		st->vim_pending = 0;
+		if (c == 'd') vim_delete_line(nb);
+		return true;
+	}
+
+	switch (c) {
+		case 'h': case KEY_ARROW_LEFT:
+			note_handle_key(nb, KEY_ARROW_LEFT);
+			return true;
+		case 'l': case KEY_ARROW_RIGHT:
+			note_handle_key(nb, KEY_ARROW_RIGHT);
+			return true;
+		case 'k': case KEY_ARROW_UP:
+			note_handle_key(nb, KEY_ARROW_UP);
+			return true;
+		case 'j': case KEY_ARROW_DOWN:
+			note_handle_key(nb, KEY_ARROW_DOWN);
+			return true;
+
+		case '0':
+			nb->cur_col = 0;
+			return true;
+		case '$':
+			nb->cur_col = (int)strlen(nb->lines[nb->cur_line]);
+			if (nb->cur_col > 0) nb->cur_col--; /* vim's $ lands on the last char, not past it */
+			return true;
+		case 'w':
+			vim_move_word_forward(nb);
+			return true;
+		case 'b':
+			vim_move_word_backward(nb);
+			return true;
+		case 'G':
+			nb->cur_line = nb->line_count - 1;
+			nb->cur_col = 0;
+			return true;
+		case 'g':
+			st->vim_pending = 'g';
+			return true;
+
+		case 'x': {
+			int len = (int)strlen(nb->lines[nb->cur_line]);
+			if (nb->cur_col < len) {
+				nb->cur_col++;
+				note_handle_key(nb, '\b'); /* delete-before-cursor, after moving past the target char, is delete-under-cursor */
+			}
+			return true;
+		}
+		case 'd':
+			st->vim_pending = 'd';
+			return true;
+
+		case 'i':
+			st->vim_mode = VIM_INSERT;
+			return true;
+		case 'a': {
+			int len = (int)strlen(nb->lines[nb->cur_line]);
+			if (nb->cur_col < len) nb->cur_col++;
+			st->vim_mode = VIM_INSERT;
+			return true;
+		}
+		case 'I':
+			nb->cur_col = 0;
+			st->vim_mode = VIM_INSERT;
+			return true;
+		case 'A':
+			nb->cur_col = (int)strlen(nb->lines[nb->cur_line]);
+			st->vim_mode = VIM_INSERT;
+			return true;
+		case 'o':
+			nb->cur_col = (int)strlen(nb->lines[nb->cur_line]);
+			note_handle_key(nb, '\n');
+			st->vim_mode = VIM_INSERT;
+			return true;
+		case 'O':
+			nb->cur_col = 0;
+			note_handle_key(nb, '\n');
+			/* note_handle_key('\n') split the (empty-prefix) line and
+			 * moved the cursor onto the new second line - opening
+			 * "above" means the blank line has to be the one now
+			 * sitting where the original line was, with the cursor
+			 * left on it, not the one the split moved onto. */
+			if (nb->cur_line > 0) {
+				char tmp[NOTE_MAX_LINE_LEN];
+				strcpy(tmp, nb->lines[nb->cur_line - 1]);
+				strcpy(nb->lines[nb->cur_line - 1], nb->lines[nb->cur_line]);
+				strcpy(nb->lines[nb->cur_line], tmp);
+				nb->cur_line--;
+			}
+			st->vim_mode = VIM_INSERT;
+			return true;
+
+		default:
+			return false;
 	}
 }
 
@@ -724,6 +956,8 @@ static void key_texteditor(struct window *w, char c) {
 			note_load(&st->nb, FAT16_ROOT_CLUSTER, st->filename);
 			st->loaded = true;
 			st->picking_filename = false;
+			st->vim_mode = VIM_NORMAL;
+			st->vim_pending = 0;
 		} else if (c == '\b') {
 			if (st->filename_len > 0) st->filename[--st->filename_len] = '\0';
 		} else if (c >= 32 && c < 127 && st->filename_len < TEXTEDITOR_FILENAME_MAX - 1) {
@@ -735,9 +969,270 @@ static void key_texteditor(struct window *w, char c) {
 
 	if (c == CTRL_KEY('s')) {
 		note_save(&st->nb, FAT16_ROOT_CLUSTER, st->filename);
-	} else {
-		note_handle_key(&st->nb, c);
+		return;
 	}
+
+	if (st->vim_mode == VIM_NORMAL) {
+		vim_handle_normal_key(st, c);
+		return;
+	}
+
+	/* insert mode */
+	if (c == 27) { /* Esc: back to normal mode, and clamp the cursor off
+	                * the (possibly now-empty) end-of-line position the
+	                * same way real vim does, since normal mode never
+	                * parks the cursor one past the last character. */
+		st->vim_mode = VIM_NORMAL;
+		int len = (int)strlen(st->nb.lines[st->nb.cur_line]);
+		if (st->nb.cur_col > 0 && st->nb.cur_col >= len) st->nb.cur_col--;
+		return;
+	}
+	note_handle_key(&st->nb, c);
+}
+
+/* --- Terminal: a real window around the exact same shell/filesystem
+ * commands the top-level console shell runs (shell.c's shell_dispatch(),
+ * terminal.c's terminal_dispatch()) - not a separate reimplementation.
+ * Two things make that possible without touching those commands:
+ *
+ *  1. Every command in them only ever calls console_putchar/
+ *     console_writestring/console_present, never reads the framebuffer
+ *     back - so console_redirect_to() (see console.c) can point that
+ *     output at this window's own vconsole scrollback grid instead of
+ *     the real framebuffer console, and paint_terminal() below just
+ *     draws whatever ends up in it, the same way con_redraw_all() draws
+ *     the real console.
+ *  2. shell_dispatch() itself never blocks for more input - it runs one
+ *     command to completion and returns (see shell.c's doc comment on
+ *     it). Only read_line() (accumulating a line before dispatch) and
+ *     cmd_nano() (its own keyboard loop) block, and neither is used
+ *     here: key_terminal() accumulates the line itself, one keystroke
+ *     per frame, matching every other windowed app; `nano` is caught
+ *     before shell_dispatch() ever sees it and driven through
+ *     noteedit.c's note_handle_key() instead (exactly like Text Editor),
+ *     which is what makes it non-blocking too.
+ *
+ * `run`ning a compiled program is the one remaining exception: asm_run()
+ * really does run the program synchronously on the kernel's only thread
+ * of execution, so the WM (and every other window) genuinely freezes
+ * for as long as that program runs, or until it crashes/exits - no
+ * different from a real terminal blocking on a foreground process, and
+ * inherent to this kernel having no process isolation or concurrency at
+ * all (see asm.c's file comment). A crashing program no longer takes
+ * the whole system down with it (see idt.c's isr_handler) but it does
+ * still own the CPU until it returns. */
+#define TERMINAL_LINE_MAX 256
+#define TERMINAL_NANO_FILENAME_MAX 32
+#define TERMINAL_COLS 80 /* matches terminal_natural_size()'s width below */
+
+struct terminal_state {
+	struct vconsole vc;
+	char line[TERMINAL_LINE_MAX];
+	int line_len;
+
+	/* nano sub-mode: entered when the line "nano FILENAME" is submitted
+	 * (see key_terminal() below), left on Ctrl+X. Reuses noteedit.c's
+	 * buffer/key-handling core, same as Text Editor - console_redirect_to()
+	 * stays pointed at `vc` throughout, but nano's own paint/key take
+	 * over instead of the line-editor above. */
+	bool in_nano;
+	char nano_filename[TERMINAL_NANO_FILENAME_MAX];
+	struct note_buffer nb;
+};
+static struct terminal_state terminal[MAX_WINDOWS];
+
+static void terminal_natural_size(int *out_w, int *out_h) {
+	int cw = gfx_char_width(), ch = gfx_char_height();
+	*out_w = 80 * cw + 2 * PADDING;
+	*out_h = 24 * (ch + 2) + 2 * PADDING;
+}
+
+/* Redraws st->vc's scrollback grid into the window's content area -
+ * the windowed equivalent of console.c's con_redraw_all(), just reading
+ * from a struct vconsole instead of the real console's own globals. */
+static void terminal_draw_vconsole(struct window *w, struct terminal_state *st) {
+	int cw = gfx_char_width();
+	int ch = gfx_char_height() + 2;
+	int x0 = w->x + PADDING, y0 = w->y + TITLEBAR_H + PADDING;
+	int content_w = w->w - 2 * PADDING;
+	int content_h = w->h + TITLEBAR_H - (y0 - w->y) - PADDING;
+	int visible_rows = content_h / ch;
+	if (visible_rows < 1) visible_rows = 1;
+
+	/* vc->cur_y counts up forever and wraps into the ring via %
+	 * VCON_ROWS (see vconsole_putchar) - so "how many real rows of
+	 * scrollback exist so far" is capped at VCON_ROWS, same idea as
+	 * con_scroll() dropping the oldest real console row once full. */
+	int total_rows = st->vc.cur_y + 1;
+	if (total_rows > VCON_ROWS) total_rows = VCON_ROWS;
+	int first = st->vc.cur_y - visible_rows + 1;
+	if (first < st->vc.cur_y - total_rows + 1) first = st->vc.cur_y - total_rows + 1;
+	if (first < 0) first = 0;
+
+	int y = y0;
+	for (int row = first; row <= st->vc.cur_y; row++) {
+		int r = row % VCON_ROWS;
+		int x = x0;
+		for (int col = 0; col < st->vc.cols && col < content_w / cw; col++) {
+			char c = st->vc.cell_char[r][col];
+			if (c && c != ' ') gfx_draw_char(x, y, c, st->vc.cell_color[r][col]);
+			x += cw;
+		}
+		y += ch;
+	}
+
+	if (((timer_get_ticks() / 30) % 2) == 0) {
+		int cursor_row = st->vc.cur_y - first;
+		if (cursor_row >= 0 && cursor_row < visible_rows) {
+			int cx = x0 + st->vc.cur_x * cw;
+			int cy = y0 + cursor_row * ch;
+			gfx_fill_rect(cx, cy + ch - 3, cw, 2, w->accent);
+		}
+	}
+}
+
+static void paint_terminal(struct window *w) {
+	int idx = (int)(w - windows);
+	struct terminal_state *st = &terminal[idx];
+
+	gfx_fill_rect(w->x + 1, w->y + TITLEBAR_H, w->w - 2, w->h - 1, GFX_RGB(0x10, 0x12, 0x18));
+
+	if (st->in_nano) {
+		/* Reuse Text Editor's own layout for the editing surface -
+		 * console_redirect_to() is still pointed at st->vc here, but
+		 * nothing writes through it while in nano sub-mode, so drawing
+		 * straight from st->nb instead (like paint_texteditor does) is
+		 * correct and keeps one real rendering for nano instead of a
+		 * second copy. */
+		int cw = gfx_char_width();
+		int x = w->x + PADDING, y = w->y + TITLEBAR_H + PADDING;
+		int lh = gfx_char_height() + 4;
+
+		char header[TERMINAL_NANO_FILENAME_MAX + 32];
+		strcpy(header, st->nano_filename);
+		if (st->nb.dirty) strcat(header, " [modified]");
+		strcat(header, " -- Ctrl+S save, Ctrl+X exit");
+		gfx_draw_string(x, y, header, w->accent);
+		y += lh + 8;
+		int text_area_top = y;
+
+		int gutter_digits = note_line_number_digits(&st->nb);
+		int gutter_px = (gutter_digits + 3) * cw;
+		int row_h = lh;
+		int max_visible = (w->h + TITLEBAR_H - (y - w->y) - PADDING) / row_h;
+		if (max_visible < 1) max_visible = 1;
+
+		int visible_start = 0;
+		if (st->nb.cur_line >= visible_start + max_visible) visible_start = st->nb.cur_line - max_visible + 1;
+		if (st->nb.cur_line < visible_start) visible_start = st->nb.cur_line;
+		if (st->nb.line_count > max_visible && visible_start > st->nb.line_count - max_visible) {
+			visible_start = st->nb.line_count - max_visible;
+		}
+		if (visible_start < 0) visible_start = 0;
+
+		for (int i = visible_start; i < st->nb.line_count && i < visible_start + max_visible; i++) {
+			char numbuf[16];
+			int n = i + 1, p = 15;
+			numbuf[p] = '\0';
+			while (n > 0) { numbuf[--p] = (char)('0' + n % 10); n /= 10; }
+			int num_w = gfx_string_width(&numbuf[p]);
+			gfx_draw_string(x + gutter_px - cw * 3 - num_w, y, &numbuf[p], COL_TEXT_DIM);
+			gfx_draw_string(x + gutter_px - cw * 2, y, "|", COL_TEXT_DIM);
+			gfx_draw_string(x + gutter_px, y, st->nb.lines[i], COL_TEXT);
+			y += row_h;
+		}
+
+		if (((timer_get_ticks() / 30) % 2) == 0) {
+			int cursor_row = st->nb.cur_line - visible_start;
+			if (cursor_row >= 0 && cursor_row < max_visible) {
+				int cx = x + gutter_px + st->nb.cur_col * cw;
+				int cy = text_area_top + cursor_row * row_h;
+				gfx_fill_rect(cx, cy, 2, gfx_char_height(), w->accent);
+			}
+		}
+		return;
+	}
+
+	terminal_draw_vconsole(w, st);
+}
+
+/* Runs one submitted line: special-cases `nano` (see the file comment
+ * above) and otherwise hands off to shell_dispatch() exactly the way
+ * the console shell does, with console_redirect_to(&st->vc) making sure
+ * whatever it prints lands in this window instead of the real console.
+ * `should_exit`/`exit` (shell_dispatch's "return to desktop" signal for
+ * the old console-takeover Terminal) has no desktop to return to here -
+ * closing the window is what the titlebar's close button is for - but
+ * typing `exit` closing the window anyway matches what a real terminal
+ * does with its one shell process exiting, so it's kept as a convenience
+ * rather than silently swallowed. */
+static void terminal_submit_line(struct window *w, struct terminal_state *st) {
+	st->line[st->line_len] = '\0';
+	console_putchar('\n');
+
+	/* Peek at the command word on a scratch copy - shell_dispatch()
+	 * below does its own strtok_simple() on the real line and needs it
+	 * unmodified, so the nano check can't just reuse its tokens. */
+	static char peek[TERMINAL_LINE_MAX];
+	strcpy(peek, st->line);
+	char *saveptr;
+	char *cmd = strtok_simple(peek, ' ', &saveptr);
+	char *rest = cmd ? strtok_simple(NULL, '\0', &saveptr) : NULL;
+
+	if (cmd && strcmp(cmd, "nano") == 0) {
+		if (!rest || rest[0] == '\0') {
+			console_writestring("usage: nano FILENAME\n");
+		} else {
+			int i = 0;
+			for (; rest[i] && i < TERMINAL_NANO_FILENAME_MAX - 1; i++) st->nano_filename[i] = rest[i];
+			st->nano_filename[i] = '\0';
+			note_load(&st->nb, terminal_cwd_cluster(), st->nano_filename);
+			st->in_nano = true;
+		}
+	} else if (cmd) {
+		bool should_exit = false;
+		shell_dispatch(st->line, true, &should_exit);
+		if (should_exit) w->used = false;
+	}
+
+	st->line_len = 0;
+
+	if (w->used && !st->in_nano) shell_print_prompt();
+}
+
+static void key_terminal(struct window *w, char c) {
+	int idx = (int)(w - windows);
+	struct terminal_state *st = &terminal[idx];
+
+	console_redirect_to(&st->vc);
+
+	if (st->in_nano) {
+		if (c == CTRL_KEY('x')) {
+			if (st->nb.dirty) note_save(&st->nb, terminal_cwd_cluster(), st->nano_filename);
+			st->in_nano = false;
+			shell_print_prompt();
+		} else if (c == CTRL_KEY('s')) {
+			note_save(&st->nb, terminal_cwd_cluster(), st->nano_filename);
+		} else {
+			note_handle_key(&st->nb, c);
+		}
+		console_redirect_to(NULL);
+		return;
+	}
+
+	if (c == '\n') {
+		terminal_submit_line(w, st);
+	} else if (c == '\b') {
+		if (st->line_len > 0) {
+			st->line_len--;
+			console_putchar('\b');
+		}
+	} else if (c >= 32 && c < 127 && st->line_len < TERMINAL_LINE_MAX - 1) {
+		st->line[st->line_len++] = c;
+		console_putchar(c);
+	}
+
+	console_redirect_to(NULL);
 }
 
 /* --- Browser: a real (if very basic) web browser. Address bar ->
@@ -1168,12 +1663,6 @@ struct app_entry {
 	window_natural_size_fn natural_size; /* NULL to just use w/h as given */
 	enum app_icon icon;
 	gfx_color_t accent;
-	/* Console apps (Terminal) aren't drawn as a window at all - they
-	 * take over the whole screen via the software console the same way
-	 * the shell does, so launching one suspends the WM loop entirely
-	 * rather than creating a struct window. `paint`/`key`/geometry are
-	 * unused (and left zeroed) for these. */
-	bool is_console_app;
 };
 
 #define MAX_APPS 8
@@ -1195,11 +1684,6 @@ static void register_interactive_app(const char *name, int x_offset, int y_offse
 		.name = name, .x_offset = x_offset, .y_offset = y_offset, .w = w, .h = h,
 		.paint = paint, .key = key, .click = click, .scroll = scroll, .natural_size = natural_size, .icon = icon, .accent = accent,
 	};
-}
-
-static void register_console_app(const char *name, enum app_icon icon) {
-	if (app_count >= MAX_APPS) return;
-	apps[app_count++] = (struct app_entry){ .name = name, .icon = icon, .is_console_app = true };
 }
 
 static int find_open_window_by_name(const char *name) {
@@ -1249,17 +1733,6 @@ static void rescale_all_windows(void) {
 	}
 }
 
-static void run_console_app(void (*entry)(void)) {
-	console_clear();
-	gfx_set_font_scale(1);
-	entry();
-	gfx_set_font_scale(2);
-	/* the console app owns the keyboard buffer while it runs; nothing
-	 * queued during that time is meant for the desktop, so drop it
-	 * rather than have leftover keystrokes fire WM shortcuts on return */
-	while (keyboard_has_key()) keyboard_getchar_blocking();
-}
-
 /* Called exactly once, right after a fresh window is created, so apps
  * with real state (Settings' selected timezone, Text Editor's buffer)
  * start from a clean slate rather than whatever was left over in their
@@ -1278,19 +1751,19 @@ static void window_opened(int idx, const char *app_name) {
 	} else if (strcmp(app_name, "Browser") == 0) {
 		memset(&browser[idx], 0, sizeof(browser[idx]));
 		browser[idx].editing_url = true;
+	} else if (strcmp(app_name, "Terminal") == 0) {
+		memset(&terminal[idx], 0, sizeof(terminal[idx]));
+		vconsole_init(&terminal[idx].vc, TERMINAL_COLS);
+		console_redirect_to(&terminal[idx].vc);
+		console_writestring("auroraOS Terminal\n\n");
+		shell_print_prompt();
+		console_redirect_to(NULL);
 	}
 }
 
 static void launch_or_focus_app(int app_index) {
 	if (app_index < 0 || app_index >= app_count) return;
 	struct app_entry *app = &apps[app_index];
-
-	if (app->is_console_app) {
-		if (strcmp(app->name, "Terminal") == 0) {
-			run_console_app(terminal_app_run);
-		}
-		return;
-	}
 
 	int idx = find_open_window_by_name(app->name);
 	if (idx < 0) {
@@ -1325,7 +1798,7 @@ void wm_init(void) {
 	register_interactive_app("Settings", 100, 40, 380, 330, paint_settings, key_settings, click_settings, scroll_settings, settings_natural_size, ICON_GEAR, GFX_RGB(0x4D, 0xD0, 0xC7));
 	register_interactive_app("Text Editor", 40, 20, 520, 400, paint_texteditor, key_texteditor, NULL, NULL, texteditor_natural_size, ICON_DOCUMENT, COL_ACCENT);
 	register_interactive_app("Browser", 30, 10, 640, 460, paint_browser, key_browser, click_browser, scroll_browser, browser_natural_size, ICON_GLOBE, GFX_RGB(0xFF, 0x8A, 0x3D));
-	register_console_app("Terminal", ICON_TERMINAL);
+	register_interactive_app("Terminal", 60, 60, 640, 400, paint_terminal, key_terminal, NULL, NULL, terminal_natural_size, ICON_TERMINAL, GFX_RGB(0x5C, 0xE1, 0x9C));
 
 	/* Apps are registered so search/the taskbar can find them, but none
 	 * are opened automatically - the desktop boots to an empty screen,

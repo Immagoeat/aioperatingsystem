@@ -56,6 +56,13 @@ static const char *exception_messages[] = {
 	"Coprocessor Fault", "Alignment Check", "Machine Check", "Reserved"
 };
 
+/* Faulting straight into this `ret` unwinds exactly the way SYS_EXIT's
+ * exit_stub does (see syscall.c's comment on that trick): it pops the
+ * trampoline's own return address, still sitting on the stack from
+ * asm_run_trampoline's `call *rdi`, and hands control back to asm_run()
+ * as if the crashing instruction had never run. */
+static uint8_t crash_stub[] = { 0xC3 }; /* ret */
+
 void isr_handler(struct registers *regs) {
 	if (regs->int_no == 128) {
 		syscall_dispatch(regs);
@@ -64,6 +71,21 @@ void isr_handler(struct registers *regs) {
 
 	if (regs->int_no < 20) {
 		kprintf("\n[EXCEPTION] %s (int %d, err %d)\n", exception_messages[regs->int_no], (int)regs->int_no, (int)regs->err_code);
+
+		/* A compiled program has no isolation from the kernel (see
+		 * asm.c's file comment) - a bad instruction genuinely can
+		 * fault. That's the program's bug, not the kernel's, so
+		 * recover back to whoever called asm_run() instead of taking
+		 * the whole system down with it. A fault outside asm_run()
+		 * (i.e. in the kernel itself) is a real kernel bug and still
+		 * halts, since there's nowhere safe to unwind to. */
+		if (asm_program_running) {
+			kprintf("Program crashed; returning to shell.\n");
+			asm_program_crashed = true;
+			regs->rip = (uint64_t)(uintptr_t)crash_stub;
+			return;
+		}
+
 		kprintf("System halted.\n");
 		__asm__ volatile("cli");
 		for (;;) __asm__ volatile("hlt");

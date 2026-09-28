@@ -26,6 +26,13 @@ static uint16_t cwd_cluster(void) {
 	return path_depth == 0 ? 0 : path_stack[path_depth - 1].cluster;
 }
 
+/* Exposed so wm.c's windowed Terminal can load/save nano's buffer
+ * itself (see terminal_dispatch()'s doc comment on why `nano` needs
+ * special handling there instead of going through cmd_nano below). */
+uint16_t terminal_cwd_cluster(void) {
+	return cwd_cluster();
+}
+
 static void local_strncpy_term(char *dst, const char *src, size_t n) {
 	size_t i = 0;
 	for (; i < n && src[i]; i++) dst[i] = src[i];
@@ -579,7 +586,11 @@ static void cmd_run(const char *filename) {
 	console_present(); /* flush any pending output before handing control to the program */
 	uint64_t exit_code = asm_run(code, got);
 	console_present();
-	kprintf("\n[%s exited with code %llu]\n", filename, exit_code);
+	if (asm_program_crashed) {
+		kprintf("\n[%s crashed]\n", filename);
+	} else {
+		kprintf("\n[%s exited with code %llu]\n", filename, exit_code);
+	}
 }
 
 /* --- dispatch entry point, called from shell.c --- */

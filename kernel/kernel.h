@@ -150,6 +150,11 @@ bool ata_write_sector(uint32_t lba, const uint8_t *buf512);
 bool asm_assemble(const char *source, uint8_t *out_code, uint32_t out_capacity, uint32_t *out_len, char *out_error, int *out_error_line);
 uint64_t asm_run(const uint8_t *code, uint32_t len);
 extern uint64_t asm_last_exit_code; /* set by SYS_EXIT; see syscall.c */
+/* Set for the duration of asm_run()'s call into user code; idt.c's
+ * exception handler checks this to recover a crashing program instead
+ * of halting the whole kernel (see idt.c's isr_handler). */
+extern bool asm_program_running;
+extern bool asm_program_crashed;
 
 /* --- fat16.c: FAT16 filesystem driver --- */
 struct fat16_entry {
@@ -182,6 +187,26 @@ gfx_color_t console_color_dim(void);
 void console_clear(void);
 void console_putchar(char c);
 void console_write(const char *s, size_t len);
+
+/* A second, independent text grid with the exact same cell/scrolling
+ * model as the real console above, so wm.c's windowed Terminal can
+ * reuse every existing shell/terminal command (they only ever call
+ * console_putchar/console_writestring/console_present) without those
+ * commands needing to know or care whether they're running full-screen
+ * or inside a window. console_redirect_to() points console_putchar's
+ * output at one of these instead of the real framebuffer console until
+ * console_redirect_to(NULL) restores it - see wm.c's key_terminal(). */
+#define VCON_COLS 160
+#define VCON_ROWS 200
+struct vconsole {
+	char cell_char[VCON_ROWS][VCON_COLS];
+	gfx_color_t cell_color[VCON_ROWS][VCON_COLS];
+	int cols; /* usable column count - narrower than VCON_COLS to fit a real window's width */
+	int cur_x, cur_y; /* cursor cell position; cur_y counts up forever, wrapping into the ring via % VCON_ROWS */
+	gfx_color_t color;
+};
+void vconsole_init(struct vconsole *vc, int cols);
+void console_redirect_to(struct vconsole *vc); /* NULL restores the real console */
 void console_writestring(const char *s);
 void console_present(void);
 void console_set_cursor(int x, int y);
@@ -386,11 +411,17 @@ bool keyboard_has_key(void);
 
 /* --- shell.c --- */
 void shell_run(void);
-/* Launches the shell as a GUI app (see wm.c's "Terminal"): same
- * commands as the top-level shell, but with `exit` in place of `gui`.
- * Caller is responsible for switching graphics modes before/after,
- * same as the shell (Ctrl+Q) and Text Editor already do. */
-void terminal_app_run(void);
+/* Prints the "aurora:~$ " prompt (with the current directory, via
+ * terminal.c's terminal_print_cwd_prompt_suffix()) and runs one already-
+ * split command line to completion - never blocks for more input itself
+ * (see shell_dispatch's own doc comment). Exported so wm.c's windowed
+ * Terminal app can drive the exact same command set one keystroke at a
+ * time instead of shell_run()'s blocking read_line() loop - see wm.c's
+ * key_terminal()/terminal_submit_line(). `from_gui` selects `exit`
+ * instead of `gui` in the command set the same way it always has;
+ * `*should_exit` is set to true on `exit`. */
+void shell_print_prompt(void);
+void shell_dispatch(char *line, bool from_gui, bool *should_exit);
 
 /* --- settings.c: timezone data + logic for the windowed "Settings" app
  * in wm.c (see settings.c's file comment on why "auto-detect" means
@@ -435,9 +466,19 @@ bool note_handle_key(struct note_buffer *nb, char c); /* returns true if the buf
 /* --- terminal.c: filesystem-aware commands (ls, cd, touch, rm, cat,
  * mkdir, echo with redirection, nano, compile, run). Returns false if
  * `cmd` isn't one it handles, so shell.c's dispatch() can fall through
- * to its own commands / the "unknown command" message. */
+ * to its own commands / the "unknown command" message.
+ *
+ * `nano` is the one command here that reads more input itself
+ * (cmd_nano's own keyboard_getchar_blocking() loop) instead of just
+ * running to completion - fine for the console, but incompatible with
+ * a windowed caller that only gets one keystroke per frame. wm.c's
+ * key_terminal() checks for "nano" with strcmp() before calling
+ * terminal_dispatch() and, when it matches, drives noteedit.c's
+ * note_handle_key() itself (like Text Editor does) instead of letting
+ * this blocking version run - see wm.c. */
 bool terminal_dispatch(const char *cmd, char *rest);
 void terminal_print_cwd_prompt_suffix(void);
+uint16_t terminal_cwd_cluster(void);
 
 /* --- updatecmd.c: a real (not simulated) update mechanism given the
  * constraint that there's no network stack to fetch updates over - see
