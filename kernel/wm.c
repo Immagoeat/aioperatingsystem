@@ -46,6 +46,7 @@ enum app_icon {
 	ICON_DOCUMENT,  /* Text Editor */
 	ICON_GLOBE,     /* Browser */
 	ICON_TERMINAL,  /* Terminal */
+	ICON_APP,       /* a loaded program (apploader.c) - not in the static app registry (its title is the launched filename, not a fixed name), so draw_taskbar()'s name lookup never finds a match; used directly instead - see paint_apploader() */
 };
 
 struct window;
@@ -113,6 +114,21 @@ static int window_count = 0;
 static int dragging_window = -1;
 static int drag_offset_x, drag_offset_y;
 
+/* Drag-to-resize (from the bottom-right corner grip - see
+ * RESIZE_GRIP_SIZE/draw_window()'s grip drawing and handle_click()'s
+ * hit-test). Separate from dragging_window above rather than reusing
+ * it with a mode flag: a resize needs the window's ORIGINAL w/h at
+ * drag-start (resize_start_w/h) the same way a move needs the original
+ * offset - keeping two clearly-named globals instead of overloading
+ * one pair of ints for two different meanings is worth the extra
+ * fields. */
+static int resizing_window = -1;
+static int resize_start_w, resize_start_h;
+static int resize_start_mx, resize_start_my;
+#define RESIZE_GRIP_SIZE 18 /* on-screen hit-test size of the bottom-right corner grip, in pixels - not scaled with the UI-scale font setting (unlike most chrome here), since 18px stays a reasonably grabbable target even at the smallest "Compact" scale without needing to hunt for it at "Extra Large" */
+#define WINDOW_MIN_W 150 /* absolute floor for any window - well under any built-in app's own natural_size, small enough that a resize can never make a window's own titlebar buttons overlap */
+#define WINDOW_MIN_H 100
+
 static int wallpaper_btn_x, wallpaper_btn_y, wallpaper_btn_w, wallpaper_btn_h;
 static int search_btn_x, search_btn_y, search_btn_w, search_btn_h;
 static int network_btn_x, network_btn_y, network_btn_w, network_btn_h;
@@ -130,6 +146,7 @@ static int search_panel_x, search_panel_y, search_panel_w, search_panel_h;
 static int search_row_y0; /* y of the first result row, for click hit-testing */
 
 static int screen_w, screen_h;
+static bool wm_running_flag = false; /* true for the duration of wm_run()'s own loop - see wm_is_running()'s doc comment */
 
 /* Cached bounds of the taskbar's per-window buttons, recomputed each
  * frame in draw_taskbar() so handle_click() can hit-test them without
@@ -208,10 +225,11 @@ static void about_natural_size(int *out_w, int *out_h) {
 static void paint_about(struct window *w) {
 	int x = w->x + PADDING, y = w->y + TITLEBAR_H + PADDING;
 	int lh = gfx_char_height() + 6;
+	int max_x = w->x + w->w - PADDING;
 	for (int i = 0; i < ABOUT_LINE_COUNT; i++) {
 		const struct about_line *l = &about_lines[i];
 		gfx_color_t color = l->style == ABOUT_TITLE ? w->accent : (l->style == ABOUT_BODY ? COL_TEXT : COL_TEXT_DIM);
-		gfx_draw_string(x, y, l->text, color);
+		gfx_draw_string_clipped(x, y, l->text, color, max_x);
 		y += lh + (l->style == ABOUT_TITLE ? 4 : 0) + (l->extra_gap_after ? 8 : 0);
 	}
 }
@@ -233,7 +251,8 @@ static void counter_natural_size(int *out_w, int *out_h) {
 static void paint_counter(struct window *w) {
 	int x = w->x + PADDING, y = w->y + TITLEBAR_H + PADDING;
 	int lh = gfx_char_height() + 6;
-	gfx_draw_string(x, y, "System uptime", COL_TEXT_DIM); y += lh + 4;
+	int max_x = w->x + w->w - PADDING;
+	gfx_draw_string_clipped(x, y, "System uptime", COL_TEXT_DIM, max_x); y += lh + 4;
 
 	char buf[16];
 	uint32_t val = (uint32_t)w->counter;
@@ -244,8 +263,8 @@ static void paint_counter(struct window *w) {
 		buf[--i] = '0' + (val % 10);
 		val /= 10;
 	}
-	gfx_draw_string(x, y, &buf[i], w->accent);
-	gfx_draw_string(x + gfx_string_width(&buf[i]) + 8, y, "ticks", COL_TEXT_DIM);
+	gfx_draw_string_clipped(x, y, &buf[i], w->accent, max_x);
+	gfx_draw_string_clipped(x + gfx_string_width(&buf[i]) + 8, y, "ticks", COL_TEXT_DIM, max_x);
 	y += lh + 12;
 
 	int barw = w->w - 2 * PADDING;
@@ -351,7 +370,7 @@ static struct settings_layout settings_compute_layout(struct window *w) {
 static void draw_dropdown_field(int x, int field_y, int field_w, int field_h,
                                  const char *current_label, bool is_open) {
 	gfx_fill_round_rect(x, field_y, field_w, field_h, 6, is_open ? COL_WIN_BODY_ALT : COL_TASKBAR);
-	gfx_draw_string(x + 10, field_y + (field_h - gfx_char_height()) / 2, current_label, COL_TEXT);
+	gfx_draw_string_clipped(x + 10, field_y + (field_h - gfx_char_height()) / 2, current_label, COL_TEXT, x + field_w - 24); /* -24 leaves room for the chevron drawn below rather than running under it */
 
 	/* small chevron on the right edge, pointing down when closed / up
 	 * when open, so there's a visible affordance that this is
@@ -384,7 +403,7 @@ static void draw_dropdown_overlay(int x, int field_y, int field_w, int field_h, 
 		int row_y = overlay_y + 4 + i * row_h;
 		bool is_selected = (opt_index == selected);
 		if (is_selected) gfx_fill_round_rect(x + 4, row_y, field_w - 8, row_h - 2, 5, COL_TASKBAR_ACTIVE);
-		gfx_draw_string(x + 12, row_y + (row_h - gfx_char_height()) / 2 - 1, label_at(opt_index), is_selected ? COL_TEXT : COL_TEXT_DIM);
+		gfx_draw_string_clipped(x + 12, row_y + (row_h - gfx_char_height()) / 2 - 1, label_at(opt_index), is_selected ? COL_TEXT : COL_TEXT_DIM, x + field_w - 8);
 	}
 }
 
@@ -405,18 +424,19 @@ static void paint_settings(struct window *w) {
 	 * w->y are added right here, once, rather than scattered through
 	 * every draw call. */
 	int x = w->x + L.x, y = w->y + TITLEBAR_H + PADDING;
+	int max_x = w->x + w->w - PADDING;
 
-	gfx_draw_string(x, y, "Timezone", w->accent); y += L.lh + 6;
-	gfx_draw_string(x, y, "auroraOS can't detect your region (no", COL_TEXT_DIM); y += L.lh;
-	gfx_draw_string(x, y, "network/GPS) - it assumes the clock is", COL_TEXT_DIM); y += L.lh;
-	gfx_draw_string(x, y, "already local time. Pick a UTC offset:", COL_TEXT_DIM); y += L.lh + 10;
+	gfx_draw_string_clipped(x, y, "Timezone", w->accent, max_x); y += L.lh + 6;
+	gfx_draw_string_clipped(x, y, "auroraOS can't detect your region (no", COL_TEXT_DIM, max_x); y += L.lh;
+	gfx_draw_string_clipped(x, y, "network/GPS) - it assumes the clock is", COL_TEXT_DIM, max_x); y += L.lh;
+	gfx_draw_string_clipped(x, y, "already local time. Pick a UTC offset:", COL_TEXT_DIM, max_x); y += L.lh + 10;
 
 	draw_dropdown_field(x, w->y + L.tz_field_y, L.field_w, L.field_h, timezone_label_at(settings_selected[idx]), settings_open[idx] == SETTINGS_DROPDOWN_TIMEZONE);
 	y = w->y + L.tz_field_y + L.field_h + 20;
 
-	gfx_draw_string(x, y, "UI Scale", w->accent); y += L.lh + 6;
-	gfx_draw_string(x, y, "There's no real video-mode switch here,", COL_TEXT_DIM); y += L.lh;
-	gfx_draw_string(x, y, "so this resizes the desktop's UI instead:", COL_TEXT_DIM); y += L.lh;
+	gfx_draw_string_clipped(x, y, "UI Scale", w->accent, max_x); y += L.lh + 6;
+	gfx_draw_string_clipped(x, y, "There's no real video-mode switch here,", COL_TEXT_DIM, max_x); y += L.lh;
+	gfx_draw_string_clipped(x, y, "so this resizes the desktop's UI instead:", COL_TEXT_DIM, max_x); y += L.lh;
 	{
 		char detected[48];
 		strcpy(detected, "Detected screen: ");
@@ -430,7 +450,7 @@ static void paint_settings(struct window *w) {
 		if (n == 0) numbuf[--i] = '0';
 		while (n > 0) { numbuf[--i] = (char)('0' + n % 10); n /= 10; }
 		strcat(detected, &numbuf[i]);
-		gfx_draw_string(x, y, detected, COL_TEXT_DIM);
+		gfx_draw_string_clipped(x, y, detected, COL_TEXT_DIM, max_x);
 	}
 	y += L.lh + 10;
 
@@ -438,9 +458,9 @@ static void paint_settings(struct window *w) {
 
 	int footer_y = w->y + w->h + TITLEBAR_H - 24;
 	if (settings_applied[idx]) {
-		gfx_draw_string(x, footer_y, "Applied.", GFX_RGB(0x28, 0xC8, 0x40));
+		gfx_draw_string_clipped(x, footer_y, "Applied.", GFX_RGB(0x28, 0xC8, 0x40), max_x);
 	} else {
-		gfx_draw_string(x, footer_y, "Click a field to choose", COL_TEXT_DIM);
+		gfx_draw_string_clipped(x, footer_y, "Click a field to choose", COL_TEXT_DIM, max_x);
 	}
 
 	/* the open dropdown's overlay is drawn last so it floats over
@@ -636,16 +656,17 @@ static void paint_texteditor(struct window *w) {
 	struct texteditor_state *st = &texteditor[idx];
 	int x = w->x + PADDING, y = w->y + TITLEBAR_H + PADDING;
 	int lh = gfx_char_height() + 4;
+	int max_x = w->x + w->w - PADDING; /* right edge every line of text below clips to - see gfx_draw_string_clipped()'s doc comment; keeps a resized-narrower window from ever having text bleed past its own edge */
 
 	if (st->picking_filename) {
-		gfx_draw_string(x, y, "Text Editor", w->accent); y += lh + 10;
-		gfx_draw_string(x, y, "File to open (created if it doesn't", COL_TEXT_DIM); y += lh;
-		gfx_draw_string(x, y, "exist), then press Enter:", COL_TEXT_DIM); y += lh + 10;
+		gfx_draw_string_clipped(x, y, "Text Editor", w->accent, max_x); y += lh + 10;
+		gfx_draw_string_clipped(x, y, "File to open (created if it doesn't", COL_TEXT_DIM, max_x); y += lh;
+		gfx_draw_string_clipped(x, y, "exist), then press Enter:", COL_TEXT_DIM, max_x); y += lh + 10;
 
 		int field_w = w->w - 2 * PADDING;
 		int field_h = 32;
 		gfx_fill_round_rect(x, y, field_w, field_h, 6, COL_WIN_BODY_ALT);
-		gfx_draw_string(x + 10, y + (field_h - gfx_char_height()) / 2, st->filename, COL_TEXT);
+		gfx_draw_string_clipped(x + 10, y + (field_h - gfx_char_height()) / 2, st->filename, COL_TEXT, max_x - 10);
 		if (((timer_get_ticks() / 30) % 2) == 0) {
 			int cursor_x = x + 10 + gfx_string_width(st->filename);
 			gfx_fill_rect(cursor_x + 2, y + 6, 2, field_h - 12, w->accent);
@@ -660,7 +681,7 @@ static void paint_texteditor(struct window *w) {
 	char header[96];
 	strcpy(header, st->filename);
 	if (st->nb.dirty) strcat(header, " [modified]");
-	gfx_draw_string(x, y, header, w->accent);
+	gfx_draw_string_clipped(x, y, header, w->accent, max_x);
 	y += lh + 2;
 
 	char pos[48];
@@ -682,7 +703,7 @@ static void paint_texteditor(struct window *w) {
 		strcat(pos, &numbuf[i]);
 		strcat(pos, st->vim_mode == VIM_INSERT ? "  -- INSERT --" : "  -- NORMAL --");
 	}
-	gfx_draw_string(x, y, pos, st->vim_mode == VIM_INSERT ? GFX_RGB(0x5C, 0xE1, 0x9C) : COL_TEXT_DIM);
+	gfx_draw_string_clipped(x, y, pos, st->vim_mode == VIM_INSERT ? GFX_RGB(0x5C, 0xE1, 0x9C) : COL_TEXT_DIM, max_x);
 	y += lh + 8;
 	int text_area_top = y; /* first text row's y - used below for the cursor's y math too, so it can't drift out of sync with the header layout above */
 
@@ -708,9 +729,9 @@ static void paint_texteditor(struct window *w) {
 		numbuf[p] = '\0';
 		while (n > 0) { numbuf[--p] = (char)('0' + n % 10); n /= 10; }
 		int num_w = gfx_string_width(&numbuf[p]);
-		gfx_draw_string(x + gutter_px - char_w * 3 - num_w, y, &numbuf[p], COL_TEXT_DIM);
-		gfx_draw_string(x + gutter_px - char_w * 2, y, "|", COL_TEXT_DIM);
-		gfx_draw_string(x + gutter_px, y, st->nb.lines[i], COL_TEXT);
+		gfx_draw_string_clipped(x + gutter_px - char_w * 3 - num_w, y, &numbuf[p], COL_TEXT_DIM, max_x);
+		gfx_draw_string_clipped(x + gutter_px - char_w * 2, y, "|", COL_TEXT_DIM, max_x);
+		gfx_draw_string_clipped(x + gutter_px, y, st->nb.lines[i], COL_TEXT, max_x);
 		y += row_h;
 	}
 
@@ -724,10 +745,17 @@ static void paint_texteditor(struct window *w) {
 		if (cursor_row >= 0 && cursor_row < max_visible) {
 			int cx = x + gutter_px + st->nb.cur_col * char_w;
 			int cy = text_area_top + cursor_row * row_h;
-			if (st->vim_mode == VIM_NORMAL) {
-				gfx_blend_rect(cx, cy, char_w, gfx_char_height(), w->accent, 130);
-			} else {
-				gfx_fill_rect(cx, cy, 2, gfx_char_height(), w->accent);
+			/* same "stay inside this window" reasoning as
+			 * gfx_draw_string_clipped() above - a cursor sitting past
+			 * column max_x-1 (e.g. a very long line scrolled/typed past
+			 * the visible width) would otherwise draw into whatever's
+			 * to the right of this window instead of just not showing. */
+			if (cx + char_w <= max_x) {
+				if (st->vim_mode == VIM_NORMAL) {
+					gfx_blend_rect(cx, cy, char_w, gfx_char_height(), w->accent, 130);
+				} else {
+					gfx_fill_rect(cx, cy, 2, gfx_char_height(), w->accent);
+				}
 			}
 		}
 	}
@@ -1107,12 +1135,13 @@ static void paint_terminal(struct window *w) {
 		int cw = gfx_char_width();
 		int x = w->x + PADDING, y = w->y + TITLEBAR_H + PADDING;
 		int lh = gfx_char_height() + 4;
+		int max_x = w->x + w->w - PADDING;
 
 		char header[TERMINAL_NANO_FILENAME_MAX + 32];
 		strcpy(header, st->nano_filename);
 		if (st->nb.dirty) strcat(header, " [modified]");
 		strcat(header, " -- Ctrl+S save, Ctrl+X exit");
-		gfx_draw_string(x, y, header, w->accent);
+		gfx_draw_string_clipped(x, y, header, w->accent, max_x);
 		y += lh + 8;
 		int text_area_top = y;
 
@@ -1136,9 +1165,9 @@ static void paint_terminal(struct window *w) {
 			numbuf[p] = '\0';
 			while (n > 0) { numbuf[--p] = (char)('0' + n % 10); n /= 10; }
 			int num_w = gfx_string_width(&numbuf[p]);
-			gfx_draw_string(x + gutter_px - cw * 3 - num_w, y, &numbuf[p], COL_TEXT_DIM);
-			gfx_draw_string(x + gutter_px - cw * 2, y, "|", COL_TEXT_DIM);
-			gfx_draw_string(x + gutter_px, y, st->nb.lines[i], COL_TEXT);
+			gfx_draw_string_clipped(x + gutter_px - cw * 3 - num_w, y, &numbuf[p], COL_TEXT_DIM, max_x);
+			gfx_draw_string_clipped(x + gutter_px - cw * 2, y, "|", COL_TEXT_DIM, max_x);
+			gfx_draw_string_clipped(x + gutter_px, y, st->nb.lines[i], COL_TEXT, max_x);
 			y += row_h;
 		}
 
@@ -1147,7 +1176,7 @@ static void paint_terminal(struct window *w) {
 			if (cursor_row >= 0 && cursor_row < max_visible) {
 				int cx = x + gutter_px + st->nb.cur_col * cw;
 				int cy = text_area_top + cursor_row * row_h;
-				gfx_fill_rect(cx, cy, 2, gfx_char_height(), w->accent);
+				if (cx + 2 <= max_x) gfx_fill_rect(cx, cy, 2, gfx_char_height(), w->accent);
 			}
 		}
 		return;
@@ -1246,6 +1275,8 @@ static void key_terminal(struct window *w, char c) {
 #define BROWSER_HOST_MAX 128
 #define BROWSER_PATH_MAX 192
 #define BROWSER_BODY_MAX (64 * 1024)
+#define BROWSER_CSS_FETCH_MAX (32 * 1024)
+#define BROWSER_CSS_TOTAL_MAX (48 * 1024)
 
 struct browser_state {
 	char url[BROWSER_URL_MAX];
@@ -1260,17 +1291,34 @@ struct browser_state {
 	bool pending_load; /* true for exactly one frame: "Loading..." has been requested but the (blocking, possibly multi-second) fetch hasn't started yet - see wm_run()'s main loop, which checks this right after gfx_flip() so "Loading..." actually reaches the screen before the fetch blocks everything */
 	bool has_error;
 	char error[128];
+
+	/* This window's OWN copy of the last-loaded page's raw bytes, kept
+	 * around purely so resizing the window can re-run html_layout_
+	 * with_css() at the new width (see browser_relayout() below)
+	 * without re-fetching over the network - a live "the text reflows
+	 * as you drag the edge" resize needs the source HTML on hand, and
+	 * browser_body/browser_css_total below are shared, single-fetch-at-
+	 * a-time scratch space (correct for fetching, but not safe to read
+	 * back from later - a second Browser window's fetch would have
+	 * overwritten them). Real memory cost (up to BROWSER_BODY_MAX +
+	 * BROWSER_CSS_TOTAL_MAX per open Browser window) accepted
+	 * deliberately so any number of simultaneously open Browser windows
+	 * each reflow correctly, independent of what any other window most
+	 * recently fetched. */
+	uint8_t body[BROWSER_BODY_MAX];
+	uint32_t body_len;
+	uint8_t css_total[BROWSER_CSS_TOTAL_MAX];
+	uint32_t css_total_len;
+	int last_wrap_cols; /* wrap_cols html_layout_with_css() was last actually called with - browser_relayout() skips redoing the work when a resize hasn't actually changed this, since it's checked every frame the window is resizing */
 };
 static struct browser_state browser[MAX_WINDOWS];
-static uint8_t browser_body[BROWSER_BODY_MAX]; /* one fetch at a time overall (this OS has no real concurrency) - shared, not per-window */
+static uint8_t browser_body[BROWSER_BODY_MAX]; /* one fetch at a time overall (this OS has no real concurrency) - shared scratch space DURING a fetch only; struct browser_state's own body[] above is what persists after */
 /* Separate from browser_body since a page's external stylesheets are
  * fetched one at a time *after* the page body itself has already
  * been fetched into browser_body and needs to stay there (it's what
  * html_layout_with_css() parses at the end) - fetching a stylesheet
  * into the same buffer would clobber the page it's meant to style. */
-#define BROWSER_CSS_FETCH_MAX (32 * 1024)
 static uint8_t browser_css_fetch[BROWSER_CSS_FETCH_MAX];
-#define BROWSER_CSS_TOTAL_MAX (48 * 1024)
 static uint8_t browser_css_total[BROWSER_CSS_TOTAL_MAX]; /* every fetched stylesheet's text, concatenated */
 
 /* Splits "[http://|https://]host[:port][/path]" into its pieces.
@@ -1455,9 +1503,46 @@ static void browser_load(struct window *w) {
 		if (css_total_len >= sizeof(browser_css_total)) break;
 	}
 
+	/* Copy the fetched bytes into this window's OWN storage before
+	 * laying out (see struct browser_state's body[]/css_total[] doc
+	 * comment) - browser_body/browser_css_total above are shared
+	 * scratch space that a different Browser window's next fetch could
+	 * overwrite at any time, so this is the last safe moment to keep a
+	 * copy this window can re-layout from later on resize, without
+	 * re-fetching over the network each time. */
+	uint32_t copy_body_len = body_len < sizeof(st->body) ? body_len : (uint32_t)sizeof(st->body);
+	memcpy(st->body, browser_body, copy_body_len);
+	st->body_len = copy_body_len;
+	uint32_t copy_css_len = css_total_len < sizeof(st->css_total) ? css_total_len : (uint32_t)sizeof(st->css_total);
+	memcpy(st->css_total, browser_css_total, copy_css_len);
+	st->css_total_len = copy_css_len;
+
 	int wrap_cols = (w->w - 2 * PADDING) / gfx_char_width();
-	html_layout_with_css(browser_body, body_len, browser_css_total, css_total_len, &st->page, wrap_cols);
+	html_layout_with_css(st->body, st->body_len, st->css_total, st->css_total_len, &st->page, wrap_cols);
+	st->last_wrap_cols = wrap_cols;
 	st->has_page = true;
+}
+
+/* Re-runs layout ONLY, from this window's own already-fetched bytes
+ * (see struct browser_state's body[]/css_total[] doc comment) at
+ * whatever wrap_cols its CURRENT width now works out to - no network
+ * fetch, so this is cheap enough to call every frame the window is
+ * actively being resized (see key/paint dispatch below, which does
+ * exactly that whenever w->w has changed since the last check). A
+ * no-op when nothing's actually changed (wrap_cols recomputes to the
+ * same value it was last laid out at - e.g. every frame the window
+ * ISN'T being resized), so this being called often costs nothing. */
+static void browser_relayout(struct window *w) {
+	int idx = (int)(w - windows);
+	struct browser_state *st = &browser[idx];
+	if (!st->has_page) return;
+
+	int wrap_cols = (w->w - 2 * PADDING) / gfx_char_width();
+	if (wrap_cols == st->last_wrap_cols) return;
+	if (wrap_cols < 1) wrap_cols = 1;
+
+	html_layout_with_css(st->body, st->body_len, st->css_total, st->css_total_len, &st->page, wrap_cols);
+	st->last_wrap_cols = wrap_cols;
 }
 
 /* Browser content is a rendered web page - inherently open-ended and
@@ -1491,6 +1576,14 @@ static void paint_browser(struct window *w) {
 	int idx = (int)(w - windows);
 	struct browser_state *st = &browser[idx];
 	int lh = gfx_char_height() + 4;
+	int max_x = w->x + w->w - PADDING; /* right edge everything below clips to - see gfx_draw_string_clipped()'s doc comment */
+
+	/* Live reflow: cheap enough to check every frame (see
+	 * browser_relayout()'s own doc comment on why - it's a no-op
+	 * unless the window's width has genuinely changed since the last
+	 * layout), so this is what makes dragging the resize grip visibly
+	 * re-wrap the page as you drag, not just once you let go. */
+	browser_relayout(w);
 
 	/* address bar */
 	int bar_x, bar_y, field_w, field_h;
@@ -1498,7 +1591,7 @@ static void paint_browser(struct window *w) {
 	int x = w->x + bar_x, y = w->y + bar_y;
 	gfx_fill_round_rect(x, y, field_w, field_h, 6, st->editing_url ? COL_WIN_BODY_ALT : COL_TASKBAR);
 	const char *shown = st->url_len > 0 ? st->url : "Type a URL and press Enter (e.g. http://93.184.216.34/)";
-	gfx_draw_string(x + 10, y + (field_h - gfx_char_height()) / 2, shown, st->url_len > 0 ? COL_TEXT : COL_TEXT_DIM);
+	gfx_draw_string_clipped(x + 10, y + (field_h - gfx_char_height()) / 2, shown, st->url_len > 0 ? COL_TEXT : COL_TEXT_DIM, x + field_w - 8);
 	if (st->editing_url && ((timer_get_ticks() / 30) % 2) == 0) {
 		int cursor_x = x + 10 + gfx_string_width(st->url);
 		gfx_fill_rect(cursor_x + 2, y + 5, 2, field_h - 10, w->accent);
@@ -1506,24 +1599,24 @@ static void paint_browser(struct window *w) {
 	y += field_h + 10;
 
 	if (st->loading) {
-		gfx_draw_string(x, y, "Loading...", COL_TEXT_DIM);
+		gfx_draw_string_clipped(x, y, "Loading...", COL_TEXT_DIM, max_x);
 		return;
 	}
 
 	if (st->has_error) {
-		gfx_draw_string(x, y, "Error:", GFX_RGB(0xFF, 0x6B, 0x6B));
+		gfx_draw_string_clipped(x, y, "Error:", GFX_RGB(0xFF, 0x6B, 0x6B), max_x);
 		y += lh + 4;
-		gfx_draw_string(x, y, st->error, COL_TEXT_DIM);
+		gfx_draw_string_clipped(x, y, st->error, COL_TEXT_DIM, max_x);
 		return;
 	}
 
 	if (!st->has_page) {
-		gfx_draw_string(x, y, "Enter an address above, then press Enter.", COL_TEXT_DIM);
+		gfx_draw_string_clipped(x, y, "Enter an address above, then press Enter.", COL_TEXT_DIM, max_x);
 		return;
 	}
 
 	if (st->page.title[0]) {
-		gfx_draw_string(x, y, st->page.title, w->accent);
+		gfx_draw_string_clipped(x, y, st->page.title, w->accent, max_x);
 		y += lh + 6;
 	}
 
@@ -1549,12 +1642,29 @@ static void paint_browser(struct window *w) {
 		else if (line->align == 2) run_x = x + (field_w - line_w);
 		if (run_x < x) run_x = x; /* a line wider than the window (shouldn't happen post-wrap, but never draw further left than the margin) */
 
-		for (int r = 0; r < line->run_count; r++) {
+		for (int r = 0; r < line->run_count && run_x < max_x; r++) {
 			const struct html_run *run = &line->runs[r];
 			int run_w = gfx_string_width(run->text);
-			if (run->has_background) gfx_fill_rect(run_x, y, run_w, lh, run->background);
+			/* A run starting past max_x is skipped entirely by the loop
+			 * condition above; one that starts before it but would
+			 * otherwise extend past it is clamped to the background fill
+			 * only (gfx_fill_rect already clips to the real screen, not
+			 * this window specifically, so clamp run_w here too) - the
+			 * text itself uses gfx_draw_string for a still-bold-capable
+			 * run and stops drawing further characters once it crosses
+			 * max_x the same way every other clipped string here does;
+			 * true per-character clipping for BOLD runs specifically
+			 * would need a gfx_draw_string_bold_clipped() this codebase
+			 * doesn't have yet, so a bold run past the edge is bounded
+			 * by the real screen clip only - a narrow residual risk
+			 * (bold text bleeding into a neighbor window by at most one
+			 * run's width) accepted rather than adding a whole new
+			 * gfx.c primitive for it right now. */
+			int clipped_w = run_w;
+			if (run_x + clipped_w > max_x) clipped_w = max_x - run_x;
+			if (clipped_w > 0 && run->has_background) gfx_fill_rect(run_x, y, clipped_w, lh, run->background);
 			if (run->bold) gfx_draw_string_bold(run_x, y, run->text, run->color);
-			else gfx_draw_string(run_x, y, run->text, run->color);
+			else gfx_draw_string_clipped(run_x, y, run->text, run->color, max_x);
 			run_x += run_w;
 		}
 		y += lh;
@@ -1625,6 +1735,65 @@ static void scroll_browser(struct window *w, int x, int y, int delta) {
 	if (st->scroll < 0) st->scroll = 0;
 }
 
+/* --- Loaded App: a real window around a compiled program loaded from
+ * disk (see apploader.c's file comment for the full design), instead
+ * of an app whose UI is a C function built straight into this kernel
+ * binary - the actual point of the "apps out of the kernel" work this
+ * is stage 2 of. Deliberately the thinnest possible bridge: every
+ * frame's paint just resumes the app's fiber (apploader_resume()) and
+ * lets whatever it draws via SYS_GFX_* (already clipped to this
+ * window by syscall.c - see its gfx_apply_clip()) show through; key/
+ * click/scroll just push an event into the app's queue
+ * (apploader_push_event()) for it to notice next time it's resumed
+ * and calls SYS_WM_POLL_EVENT, rather than calling into the app
+ * directly the way a C-function app's callbacks do - there's no
+ * "call this app's key handler" to call, only "let it run a bit and
+ * see what it does with what's queued". Per-window state is nothing
+ * more than which apploader.c slot owns this window - everything else
+ * genuinely lives in apploader.c/the app's own fiber stack, not here. */
+static int apploader_window_slot[MAX_WINDOWS]; /* apploader.c slot index that owns this window, or -1 */
+
+static void paint_apploader(struct window *w) {
+	int idx = (int)(w - windows);
+	int slot = apploader_window_slot[idx];
+
+	/* The app may have exited or crashed since last frame (apploader.c
+	 * resets its own slot to UNUSED when that happens - see
+	 * apploader_fiber_entry()) - close this window the same way clicking
+	 * its own close button would, rather than going on drawing a
+	 * window for a program that isn't running anymore. Done here
+	 * (paint time) rather than immediately in apploader_resume() below,
+	 * since that's called from right here anyway and a window can't
+	 * un-draw itself mid-frame. */
+	if (!apploader_slot_is_alive(slot)) {
+		w->used = false;
+		return;
+	}
+
+	/* apploader_resume() itself handles keeping this window's content
+	 * visible frame to frame (restoring its cached last-drawn pixels
+	 * before resuming the fiber, capturing them again after - see
+	 * apploader.c's file comment on APP_CACHE_W/APP_CACHE_H and
+	 * apploader_resume()'s own doc comment for why that round-trip is
+	 * necessary), so there's nothing else to do here. */
+	apploader_resume(slot);
+}
+
+static void key_apploader(struct window *w, char c) {
+	int idx = (int)(w - windows);
+	apploader_push_event(apploader_window_slot[idx], WM_EVENT_KEY, (int)c, 0, 0, 0);
+}
+
+static void click_apploader(struct window *w, int x, int y) {
+	int idx = (int)(w - windows);
+	apploader_push_event(apploader_window_slot[idx], WM_EVENT_CLICK, 0, x, y, 0);
+}
+
+static void scroll_apploader(struct window *w, int x, int y, int delta) {
+	int idx = (int)(w - windows);
+	apploader_push_event(apploader_window_slot[idx], WM_EVENT_SCROLL, 0, x, y, delta);
+}
+
 static int create_window(int x, int y, int w, int h, const char *title, window_paint_fn paint, window_key_fn key, window_click_fn click, window_scroll_fn scroll, gfx_color_t accent) {
 	for (int i = 0; i < MAX_WINDOWS; i++) {
 		if (!windows[i].used) {
@@ -1647,6 +1816,20 @@ static int create_window(int x, int y, int w, int h, const char *title, window_p
 		}
 	}
 	return -1;
+}
+
+/* See kernel.h's doc comment on this - the one call syscall.c makes
+ * across into wm.c to clip/offset a loaded app's SYS_GFX_* calls into
+ * its own window (wm.c's windows[] array is otherwise entirely
+ * file-local, same as every other piece of window state here). */
+bool wm_window_rect(int window_id, int *out_x, int *out_y, int *out_w, int *out_h) {
+	if (window_id < 0 || window_id >= MAX_WINDOWS || !windows[window_id].used) return false;
+	struct window *w = &windows[window_id];
+	*out_x = w->x;
+	*out_y = w->y + TITLEBAR_H;
+	*out_w = w->w;
+	*out_h = w->h;
+	return true;
 }
 
 /* --- app registry: default geometry/paint fn for each launchable app, so
@@ -1778,6 +1961,40 @@ static void launch_or_focus_app(int app_index) {
 	}
 }
 
+/* Loads and launches `filename` as a real window - the public entry
+ * point for the whole apploader.c pipeline (see its file comment),
+ * called from terminal.c's `launch` command. Everything here is wm.c
+ * doing the half of the handshake only it can do (creating a real
+ * struct window - create_window() is file-local to here, same as
+ * every other app's window creation) once apploader_load() has already
+ * run the app far enough to know what size window it wants. Returns
+ * true on success; on failure (bad filename, no free window/fiber/app
+ * slot, or the program never called SYS_WM_CREATE_WINDOW before
+ * exiting) `out_error` is filled with a short, fixed reason - `strcpy`
+ * rather than a length-checked copy is fine here since both messages
+ * below are short string literals this file controls, not arbitrary
+ * external input. */
+bool wm_launch_app(const char *filename, uint16_t dir_cluster, char *out_error) {
+	int w, h;
+	int slot = apploader_load(filename, dir_cluster, &w, &h);
+	if (slot < 0) {
+		strcpy(out_error, "failed to load (bad file, or it never created a window)");
+		return false;
+	}
+
+	int idx = create_window(base_cx + 80, base_cy + 80, w, h, filename, paint_apploader, key_apploader, click_apploader, scroll_apploader, GFX_RGB(0x9A, 0x7B, 0xE0));
+	if (idx < 0) {
+		strcpy(out_error, "no free window slot");
+		return false;
+	}
+
+	apploader_window_slot[idx] = slot;
+	apploader_attach_window(slot, idx);
+	windows[idx].minimized = false;
+	raise_window(idx);
+	return true;
+}
+
 void wm_init(void) {
 	screen_w = gfx_width();
 	screen_h = gfx_height();
@@ -1787,6 +2004,7 @@ void wm_init(void) {
 	window_count = 0;
 	app_count = 0;
 	network_panel_open = false;
+	for (int i = 0; i < MAX_WINDOWS; i++) apploader_window_slot[i] = -1;
 	netinfo_scan(); /* so the taskbar icon reflects real status immediately, not just after the first click */
 
 	base_cx = screen_w / 2 - 340;
@@ -1885,6 +2103,16 @@ static void draw_app_icon(int x, int y, int size, enum app_icon icon, gfx_color_
 			gfx_draw_line(x + size / 5, py, x + size / 2, y + size / 2, COL_WIN_BODY);
 			gfx_draw_line(x + size / 5, py + size / 3, x + size / 2, y + size / 2, COL_WIN_BODY);
 			gfx_fill_rect(x + size / 2, y + size * 2 / 3, size / 3, 1, COL_WIN_BODY);
+			break;
+		}
+		case ICON_APP: {
+			/* a generic "window" glyph - a small rectangle with its own
+			 * tiny titlebar strip, since a loaded program has no fixed
+			 * identity/icon of its own to draw (see this enum's comment
+			 * on ICON_APP) */
+			gfx_fill_round_rect(x, y, size, size, 3, color);
+			int bar_h = size / 3;
+			gfx_fill_rect(x + 2, y + 2, size - 4, bar_h - 2, COL_WIN_BODY);
 			break;
 		}
 		case ICON_NONE:
@@ -2020,6 +2248,21 @@ static void draw_window(struct window *w, bool active) {
 	}
 
 	if (w->paint) w->paint(w);
+
+	/* Resize grip: a small set of diagonal notches in the bottom-right
+	 * corner, the same visual language real desktop OSes use for a
+	 * draggable corner - drawn last (on top of whatever w->paint() just
+	 * drew) so it's always reachable even over a window that paints all
+	 * the way to its own edges. Fullscreen windows have no free corner
+	 * to grab (see handle_click()'s matching exemption), so there's
+	 * nothing to draw for one. */
+	if (!w->fullscreen) {
+		gfx_color_t grip_color = active ? COL_TEXT_DIM : COL_TITLE_INACT;
+		int gx = w->x + w->w - 4, gy = w->y + total_h - 4;
+		for (int i = 1; i <= 3; i++) {
+			gfx_draw_line(gx - i * 4, gy, gx, gy - i * 4, grip_color);
+		}
+	}
 }
 
 static int current_wallpaper = 0;
@@ -2120,7 +2363,7 @@ static void draw_taskbar(void) {
 		struct window *w = &windows[idx];
 		if (!w->used) continue;
 
-		enum app_icon icon = ICON_NONE;
+		enum app_icon icon = ICON_APP; /* a loaded program's window (apploader.c) - not in the static registry below, since its title is its launched filename, not a fixed app name */
 		for (int a = 0; a < app_count; a++) {
 			if (strcmp(apps[a].name, w->title) == 0) { icon = apps[a].icon; break; }
 		}
@@ -2562,11 +2805,33 @@ static void handle_click(int x, int y) {
 		return;
 	}
 
+	/* Bottom-right corner grip, checked after the titlebar (so it can
+	 * never shadow the close/minimize/maximize buttons above) and
+	 * before the generic content click below (so a grip click never
+	 * accidentally reaches an app's own click handler too). Same
+	 * "fullscreen isn't draggable" exemption as the titlebar-move check
+	 * above - a fullscreen window has no free edge to grab anyway. */
+	if (!w->fullscreen &&
+	    x >= w->x + w->w - RESIZE_GRIP_SIZE && x < w->x + w->w &&
+	    y >= w->y + TITLEBAR_H + w->h - RESIZE_GRIP_SIZE && y < w->y + TITLEBAR_H + w->h) {
+		resizing_window = idx;
+		resize_start_w = w->w;
+		resize_start_h = w->h;
+		resize_start_mx = x;
+		resize_start_my = y;
+		return;
+	}
+
 	if (w->click) w->click(w, x - w->x, y - w->y);
+}
+
+bool wm_is_running(void) {
+	return wm_running_flag;
 }
 
 void wm_run(void) {
 	mouse_set_bounds(screen_w, screen_h);
+	wm_running_flag = true;
 
 	bool prev_button_down = false;
 
@@ -2580,6 +2845,7 @@ void wm_run(void) {
 			handle_click(mx, my);
 		} else if (!button_down) {
 			dragging_window = -1;
+			resizing_window = -1;
 		}
 
 		int wheel_delta = mouse_get_wheel_delta();
@@ -2602,6 +2868,31 @@ void wm_run(void) {
 			if (w->x + w->w > screen_w) w->x = screen_w - w->w;
 			if (w->y + w->h + TITLEBAR_H > screen_h - TASKBAR_H)
 				w->y = screen_h - TASKBAR_H - w->h - TITLEBAR_H;
+		}
+
+		if (resizing_window >= 0 && button_down) {
+			struct window *w = &windows[resizing_window];
+			int new_w = resize_start_w + (mx - resize_start_mx);
+			int new_h = resize_start_h + (my - resize_start_my);
+			if (new_w < WINDOW_MIN_W) new_w = WINDOW_MIN_W;
+			if (new_h < WINDOW_MIN_H) new_h = WINDOW_MIN_H;
+			/* A loaded app's window (wm.c's paint_apploader) has a real,
+			 * fixed-size pixel cache behind it (see apploader.c's
+			 * APP_CACHE_W/APP_CACHE_H) - growing the window past that
+			 * would read/write past the end of that buffer the moment
+			 * apploader_resume() next restores/snapshots it, so it's a
+			 * hard ceiling for that one case, not just a cosmetic limit
+			 * the way WINDOW_MIN_W/H above are. Every built-in app has
+			 * no such ceiling (they draw fresh into the real framebuffer
+			 * every frame, whatever size the window currently is). */
+			if (w->paint == paint_apploader) {
+				if (new_w > APP_CACHE_W) new_w = APP_CACHE_W;
+				if (new_h > APP_CACHE_H) new_h = APP_CACHE_H;
+			}
+			if (w->x + new_w > screen_w) new_w = screen_w - w->x;
+			if (w->y + new_h + TITLEBAR_H > screen_h - TASKBAR_H) new_h = screen_h - TASKBAR_H - TITLEBAR_H - w->y;
+			w->w = new_w;
+			w->h = new_h;
 		}
 
 		prev_button_down = button_down;
@@ -2672,6 +2963,7 @@ void wm_run(void) {
 				}
 			} else if (c == CTRL_KEY('q')) {
 				gfx_set_font_scale(1);
+				wm_running_flag = false;
 				return;
 			} else if (c == CTRL_KEY('w')) {
 				cycle_wallpaper();

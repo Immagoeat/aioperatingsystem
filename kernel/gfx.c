@@ -324,6 +324,38 @@ void gfx_draw_string(int x, int y, const char *s, gfx_color_t fg) {
 	}
 }
 
+/* Same as gfx_draw_string(), but stops before drawing any character
+ * whose right edge would cross max_x (screen x-coordinate, exclusive -
+ * typically a window's own w->x + w->w) instead of running past it.
+ * gfx_draw_char() itself already clips to the real screen edges (see
+ * gfx_putpixel()), which stops a long string from ever corrupting
+ * memory or drawing off the physical display, but does nothing to
+ * stop it bleeding into whatever's drawn at a different on-screen
+ * position, e.g. a neighboring window - this is the version every app
+ * that draws arbitrary-length, potentially-long text (a file's own
+ * lines, a page's rendered text, ...) should use once it wants that
+ * text to respect its own window's bounds instead of the whole
+ * screen's. Deliberately still a hard per-character stop rather than
+ * word-wrapping onto another row - see wm.c's Text Editor/Browser for
+ * why that's the right tradeoff there (real word-wrap needs cursor/
+ * layout logic well beyond what a generic gfx.c primitive should own). */
+void gfx_draw_string_clipped(int x, int y, const char *s, gfx_color_t fg, int max_x) {
+	int cx = x;
+	int cw = gfx_char_width();
+	int ch = gfx_char_height();
+	while (*s) {
+		if (*s == '\n') {
+			cx = x;
+			y += ch;
+		} else {
+			if (cx + cw > max_x) break;
+			gfx_draw_char(cx, y, *s, fg);
+			cx += cw;
+		}
+		s++;
+	}
+}
+
 void gfx_draw_string_bold(int x, int y, const char *s, gfx_color_t fg) {
 	int cx = x;
 	int cw = gfx_char_width();

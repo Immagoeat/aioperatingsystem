@@ -593,6 +593,31 @@ static void cmd_run(const char *filename) {
 	}
 }
 
+/* Loads a compiled program the same way `run` does, but gives it a
+ * real window instead of taking over the whole console (see
+ * apploader.c's file comment for the full design) - only meaningful
+ * while the desktop is actually running, since it's wm.c's own live
+ * window/geometry state that this ends up touching; a compiled program
+ * that never calls SYS_WM_CREATE_WINDOW (see docs/SYSCALLS.md) isn't a
+ * launchable app in this sense and gets the same "No such file"-style
+ * refusal `run` would give a bad filename, not a mysterious silent
+ * failure. */
+static void cmd_launch(const char *filename) {
+	if (!fs_ready()) return;
+	if (!filename || filename[0] == '\0') { console_writestring("usage: launch PROGRAM.bin\n"); return; }
+	if (!wm_is_running()) {
+		console_writestring("launch only works from inside the desktop - type `gui` first.\n");
+		return;
+	}
+
+	char error[80];
+	if (!wm_launch_app(filename, cwd_cluster(), error)) {
+		kprintf("Couldn't launch %s: %s\n", filename, error);
+		return;
+	}
+	kprintf("Launched %s.\n", filename);
+}
+
 /* --- dispatch entry point, called from shell.c --- */
 
 bool terminal_dispatch(const char *cmd, char *rest) {
@@ -605,6 +630,7 @@ bool terminal_dispatch(const char *cmd, char *rest) {
 	else if (strcmp(cmd, "nano") == 0) { cmd_nano(rest); }
 	else if (strcmp(cmd, "compile") == 0) { cmd_compile(rest); }
 	else if (strcmp(cmd, "run") == 0) { cmd_run(rest); }
+	else if (strcmp(cmd, "launch") == 0) { cmd_launch(rest); }
 	else if (strcmp(cmd, "echo") == 0) { cmd_echo_maybe_redirect(rest); }
 	else if (strcmp(cmd, "update") == 0) { updatecmd_run(); }
 	else if (strcmp(cmd, "netconnect") == 0) { cmd_netconnect(); }

@@ -78,10 +78,16 @@ void isr_handler(struct registers *regs) {
 		 * recover back to whoever called asm_run() instead of taking
 		 * the whole system down with it. A fault outside asm_run()
 		 * (i.e. in the kernel itself) is a real kernel bug and still
-		 * halts, since there's nowhere safe to unwind to. */
-		if (asm_program_running) {
+		 * halts, since there's nowhere safe to unwind to. Same
+		 * recovery for a loaded windowed app's own code faulting
+		 * (apploader_program_running - see apploader.c's file comment):
+		 * its entry trampoline reuses asm_run_trampoline exactly the
+		 * way `run PROGRAM.bin` does, so the same crash_stub unwind
+		 * lands back in apploader_fiber_entry() correctly either way. */
+		if (asm_program_running || apploader_program_running) {
 			kprintf("Program crashed; returning to shell.\n");
 			asm_program_crashed = true;
+			apploader_program_crashed = true;
 			regs->rip = (uint64_t)(uintptr_t)crash_stub;
 			return;
 		}

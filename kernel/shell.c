@@ -68,6 +68,7 @@ static void cmd_help(bool from_gui) {
 	console_writestring("\nCustom programs (see docs/ASSEMBLY.md, docs/SYSCALLS.md):\n");
 	console_writestring("  compile SRC.asm       - assemble SRC.asm to SRC.bin\n");
 	console_writestring("  run PROGRAM.bin       - run a compiled program\n");
+	console_writestring("  launch PROGRAM.bin    - run a compiled program in its own window (desktop only)\n");
 	console_writestring("\nSystem update (see README):\n");
 	console_writestring("  update                - validate + install a staged kernel update\n");
 	console_writestring("\nNetwork (wired only - see README):\n");

@@ -406,3 +406,44 @@ asm_run_trampoline:
 	pop %rbp
 	pop %rbx
 	ret
+
+/* --- fiber_switch: the actual context switch for fiber.c's cooperative
+ * scheduler (see fiber.c's file comment for the whole design - this is
+ * only the low-level half that has to be hand-written assembly, since
+ * "save every callee-saved register and swap %rsp for a different
+ * stack entirely" isn't expressible in C). Two arguments per the System
+ * V ABI: %rdi = where to save the *current* stack's resulting %rsp
+ * (a uint64_t* - typically &current_fiber->rsp), %rsi = the %rsp to
+ * switch to (a fiber_context's saved rsp field, read by C before this
+ * call - passed by value, not by pointer, since it's only ever read
+ * here, never written through).
+ *
+ * The trick that makes this work with no special-cased "first time
+ * this fiber runs" path: switching TO a fiber is just popping
+ * callee-saved registers off whatever %rsp points to and then `ret`ing
+ * - so as long as that stack has a return address sitting where `ret`
+ * expects one (with 6 register-sized slots above it matching the push
+ * order below), it doesn't matter whether that return address and
+ * those slots were put there by a previous fiber_switch() call
+ * (resuming a fiber that yielded) or synthesized by fiber_create()
+ * (starting a brand new one) - this code can't tell the difference,
+ * which is exactly the point. */
+.global fiber_switch
+fiber_switch:
+	push %rbx
+	push %rbp
+	push %r12
+	push %r13
+	push %r14
+	push %r15
+
+	mov %rsp, (%rdi)   /* *save_rsp_here = %rsp, now that this fiber's full state is on its own stack */
+	mov %rsi, %rsp     /* switch stacks - everything below now operates on the OTHER fiber's stack */
+
+	pop %r15
+	pop %r14
+	pop %r13
+	pop %r12
+	pop %rbp
+	pop %rbx
+	ret                /* pops the return address fiber_create() or a prior fiber_switch() left on the new stack */

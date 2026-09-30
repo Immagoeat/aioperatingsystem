@@ -156,6 +156,60 @@ extern uint64_t asm_last_exit_code; /* set by SYS_EXIT; see syscall.c */
 extern bool asm_program_running;
 extern bool asm_program_crashed;
 
+/* --- fiber.c: cooperative multitasking (several separate stacks that
+ * take turns running, switching only at an explicit fiber_yield() -
+ * see fiber.c's file comment for the full design and why it's
+ * cooperative rather than preemptive). This is the foundation the
+ * "apps out of the kernel" work is built on: fiber_spawn() starts
+ * `entry` running in a fresh stack and returns its slot index (or -1 if
+ * every slot is full); fiber_resume(idx) runs that fiber until it next
+ * yields (or exits) and returns control here; fiber_yield(), called
+ * from inside a fiber, hands control back to whoever resumed it.
+ * fiber_is_running() tells syscall.c/wm.c whether the code currently
+ * executing is inside a fiber at all (so e.g. a syscall that only makes
+ * sense from a fibered app can tell the difference from a directly
+ * `run` program - see asm.c/syscall.c, unrelated to fibers, for that
+ * older non-fibered execution path). */
+int fiber_spawn(void (*entry)(void));
+void fiber_resume(int idx);
+void fiber_yield(void);
+bool fiber_is_running(void);
+
+/* --- apploader.c: stage 2 of "apps out of the kernel" - loads a
+ * compiled flat binary (the same kind `run PROGRAM.bin` executes, see
+ * asm.c/docs/ASSEMBLY.md) from FAT16 and runs it as a fiber with a
+ * real window, instead of every app being a C function built into the
+ * kernel. See apploader.c's file comment for the full design (why
+ * loading is a two-step handshake with wm.c, why input/window-size
+ * syscalls are shaped the way they are given this ISA has no data
+ * section to pass pointers through). */
+/* A loaded app's window content is backed by a fixed-size per-slot
+ * pixel cache (see apploader.c's file comment on APP_CACHE_W/H for
+ * why) - defined here rather than only in apploader.c since wm.c's
+ * resize handling (dragging a loaded app's window bigger) needs the
+ * same ceiling as a hard limit, not just apploader.c's own
+ * SYS_WM_CREATE_WINDOW clamp. */
+#define APP_CACHE_W 640
+#define APP_CACHE_H 480
+int apploader_load(const char *filename, uint16_t dir_cluster, int *out_w, int *out_h); /* -1 on failure; out_w/out_h filled in on success, ready to create the real window with */
+void apploader_attach_window(int app_slot, int window_id); /* called once, right after wm.c creates the window apploader_load() asked for */
+void apploader_resume(int slot); /* runs slot's fiber for one frame's slice - called from wm.c's paint_apploader() */
+bool apploader_slot_is_alive(int slot);
+const char *apploader_slot_filename(int slot);
+void apploader_push_event(int slot, int type, int key, int x, int y, int delta); /* called from wm.c's key/click/scroll dispatch for a loaded app's window */
+int apploader_current_slot(void); /* -1 unless syscall.c is currently dispatching a call made by a loaded app's own fiber */
+int apploader_current_window_id(void); /* -1 under the same condition as apploader_current_slot() */
+extern bool apploader_program_running; /* set for the duration of a loaded app's own code running (mirrors asm_program_running - see idt.c's isr_handler, which checks this the same way to recover a crash instead of halting) */
+extern bool apploader_program_crashed;
+/* syscall.c-facing helpers for the SYS_WM_* syscalls themselves - see
+ * kernel.h's SYS_WM_* constants below and syscall.c's dispatch. */
+bool apploader_syscall_create_window(int w, int h);
+int apploader_syscall_poll_event(void);
+int apploader_syscall_event_key(void);
+int apploader_syscall_event_x(void);
+int apploader_syscall_event_y(void);
+int apploader_syscall_event_delta(void);
+
 /* --- fat16.c: FAT16 filesystem driver --- */
 struct fat16_entry {
 	char name[13]; /* "NAME.EXT\0" */
@@ -266,6 +320,29 @@ void register_interrupt_handler(uint8_t n, isr_t handler);
 #define SYS_GFX_HEIGHT   13
 #define SYS_GET_TICKS    14
 #define SYS_SLEEP_TICKS  15
+
+/* --- windowed-app syscalls (see apploader.c's file comment for the
+ * whole design). A loaded app gets a real struct window (see wm.c) -
+ * these are how it asks for one and finds out what's happening to it,
+ * since it has no C runtime/globals of its own to be handed a struct
+ * through. SYS_GFX_* above still work for a windowed app once its
+ * window exists - see apploader.c on how they get clipped/offset to
+ * the app's own window instead of the full screen. */
+#define SYS_YIELD             16 /* hand control back to the WM for this frame; returns once resumed next frame. No arguments, no return value. */
+#define SYS_WM_CREATE_WINDOW  17 /* rdi=width, rsi=height. Must be called before any SYS_GFX_* call. Returns 1 on success, 0 if every window slot is full (rare - MAX_WINDOWS is generous) */
+#define SYS_WM_POLL_EVENT     18 /* no arguments. Returns 0 (no event waiting) or a WM_EVENT_* type - see below for the follow-up calls that fetch that event's actual data */
+#define SYS_WM_EVENT_KEY      19 /* valid only right after SYS_WM_POLL_EVENT returned WM_EVENT_KEY - returns the key's character code (0-255; see the KEY_ARROW_ constants and KEY_SUPER in this header for special keys, sign-extended into the low byte the same way they're stored everywhere else) */
+#define SYS_WM_EVENT_X        20 /* valid only right after SYS_WM_POLL_EVENT returned WM_EVENT_CLICK or WM_EVENT_SCROLL - the event's x, window-relative */
+#define SYS_WM_EVENT_Y        21 /* same as SYS_WM_EVENT_X, for y */
+#define SYS_WM_EVENT_DELTA    22 /* valid only right after WM_EVENT_SCROLL - the raw wheel delta (see window_scroll_fn's doc comment in wm.c) */
+
+/* SYS_WM_POLL_EVENT's return value - see the SYS_WM_EVENT_* syscalls
+ * above for how to fetch each type's actual data once seen here. */
+#define WM_EVENT_NONE   0
+#define WM_EVENT_KEY    1
+#define WM_EVENT_CLICK  2
+#define WM_EVENT_SCROLL 3
+
 void syscall_dispatch(struct registers *regs);
 
 /* --- pic.c --- */
@@ -540,6 +617,12 @@ int gfx_char_height(void);
 void gfx_draw_char(int x, int y, char c, gfx_color_t fg);
 void gfx_draw_char_bg(int x, int y, char c, gfx_color_t fg, gfx_color_t bg);
 void gfx_draw_string(int x, int y, const char *s, gfx_color_t fg);
+/* Same as gfx_draw_string(), but stops before any character would
+ * cross max_x (screen x-coordinate, exclusive) instead of running past
+ * it - see gfx.c's doc comment on it for why this exists (per-window
+ * text clipping, since gfx_draw_char() itself only clips to the real
+ * screen edges, not to any particular window's bounds). */
+void gfx_draw_string_clipped(int x, int y, const char *s, gfx_color_t fg, int max_x);
 void gfx_draw_string_bg(int x, int y, const char *s, gfx_color_t fg, gfx_color_t bg);
 /* Synthetic bold (see gfx.c's file comment): dilates each glyph row
  * one pixel to the right rather than faking weight with color alone -
@@ -674,5 +757,22 @@ uint32_t gzip_decompress(const uint8_t *data, uint32_t data_len, uint8_t *out, u
 /* --- wm.c --- */
 void wm_init(void);
 void wm_run(void);
+bool wm_is_running(void); /* true for the duration of wm_run()'s own loop - terminal.c's `launch` command checks this before calling wm_launch_app(), since that touches wm.c's live window/geometry state which is only meaningful while the WM is actually running (as opposed to the top-level console shell, which never calls wm_init()/wm_run() at all until `gui` is typed) */
+/* Window geometry lookup by window slot index, for syscall.c to clip/
+ * offset a loaded app's SYS_GFX_* calls into its own window's content
+ * area (see apploader.c's file comment) without syscall.c needing
+ * access to wm.c's own (otherwise entirely file-local) struct window
+ * array. Returns false if window_id doesn't currently refer to a used
+ * window (closed since, or never valid). out_x/out_y/out_w/out_h
+ * are the CONTENT area - below the title bar, matching every built-in
+ * app's own convention (see e.g. paint_texteditor's w->y + TITLEBAR_H). */
+bool wm_window_rect(int window_id, int *out_x, int *out_y, int *out_w, int *out_h);
+/* Loads `filename` (from `dir_cluster`) and gives it a real window -
+ * see apploader.c's file comment and this function's own doc comment
+ * in wm.c. Returns true on success; on failure writes a short, fixed
+ * reason into out_error (caller-owned buffer, expected big enough for
+ * a short fixed string - see wm.c's doc comment on why a plain strcpy
+ * is fine here). Called from terminal.c's `launch` command. */
+bool wm_launch_app(const char *filename, uint16_t dir_cluster, char *out_error);
 
 #endif

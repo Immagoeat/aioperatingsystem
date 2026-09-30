@@ -3,7 +3,20 @@
  * after that. Kept separate from auth.c (which only knows about
  * salts/hashes/disk storage, no console_* calls at all) the same way
  * this project splits other logic/rendering pairs (e.g. noteedit.c
- * vs. terminal.c's nano rendering). */
+ * vs. terminal.c's nano rendering).
+ *
+ * First boot also brings the network up automatically, right after the
+ * password is set (see first_boot_network_setup()) - the same real
+ * DHCP exchange the `netconnect` command runs by hand, not a
+ * simulation, and not a fetch from any invented "setup server" (this
+ * kernel has no update/content server to talk to - see updatecmd.c's
+ * file comment on the honest state of that). A machine with no network
+ * hardware, or hardware this OS has no driver for, says so plainly and
+ * setup continues regardless; nothing about first boot ever blocks on
+ * having a network connection. Filesystem creation (fat16_format()) and
+ * the "user" (the password itself) already happen automatically before
+ * this runs at all - see kernel.c's kernel_main() for the full boot
+ * sequence this is one step of. */
 #include "kernel.h"
 
 #define LOGIN_MAX_PASSWORD 64
@@ -28,6 +41,64 @@ static void read_password(char *buf, size_t max_len) {
 			console_putchar('*');
 		}
 		console_present();
+	}
+}
+
+/* Second half of first-boot setup, after the password is set: bring
+ * the network up automatically the same way the `netconnect` command
+ * already does by hand (net_init_and_request_lease() - see net.c),
+ * rather than leaving a fresh machine with no connectivity until the
+ * user discovers that command exists. Honest about the same real
+ * limitations netconnect's own output already is: only wired e1000
+ * hardware has an actual driver (netinfo.c), and "no network hardware
+ * at all" (common - many VMs/machines genuinely have none, or a kind
+ * this OS doesn't drive) is reported plainly and setup continues
+ * regardless - a fresh install must never get stuck or feel broken
+ * just because there's nothing to connect to. */
+static void first_boot_network_setup(void) {
+	console_writestring("Checking for a network connection...\n");
+	console_present();
+
+	netinfo_scan();
+	struct netinfo_status status;
+	if (!netinfo_get(&status)) {
+		console_set_color(console_color_dim());
+		console_writestring("No network hardware found - skipping. Run `netconnect` later\n");
+		console_writestring("if a network adapter becomes available.\n\n");
+		console_set_color(console_color_default());
+		return;
+	}
+
+	if (!status.driver_supported) {
+		console_set_color(console_color_dim());
+		console_writestring("Found ");
+		console_writestring(status.name);
+		console_writestring(", but there's no driver for it yet (only\n");
+		console_writestring("wired Intel e1000 is supported) - skipping. Run `netconnect`\n");
+		console_writestring("later if that changes.\n\n");
+		console_set_color(console_color_default());
+		return;
+	}
+
+	console_writestring("Found ");
+	console_writestring(status.name);
+	console_writestring(" - requesting a DHCP lease (this can take a few seconds)...\n");
+	console_present();
+
+	if (net_init_and_request_lease()) {
+		struct net_status net;
+		net_get_status(&net);
+		console_set_color(GFX_RGB(0x28, 0xC8, 0x40));
+		console_writestring("Connected.\n");
+		console_set_color(console_color_default());
+		console_writestring("  IP: ");
+		console_writestring(net.ip_str);
+		console_writestring("\n\n");
+	} else {
+		console_set_color(console_color_dim());
+		console_writestring("Couldn't get a DHCP lease (no cable connected, or no DHCP\n");
+		console_writestring("server reachable) - skipping. Run `netconnect` later to retry.\n\n");
+		console_set_color(console_color_default());
 	}
 }
 
@@ -66,6 +137,7 @@ static void first_boot_setup(void) {
 			console_set_color(GFX_RGB(0x28, 0xC8, 0x40));
 			console_writestring("Password set.\n\n");
 			console_set_color(console_color_default());
+			first_boot_network_setup();
 			return;
 		}
 
